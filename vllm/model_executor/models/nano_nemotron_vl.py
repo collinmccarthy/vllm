@@ -2724,9 +2724,6 @@ class NemotronH_Nano_VL_V2(
         vision_args.pop("separate_video_embedder", None)
 
         temporal_patch_dim = getattr(hf_config_vision, "video_temporal_patch_size", 1)
-        separate_video_embedder = getattr(
-            hf_config_vision, "separate_video_embedder", False
-        )
 
         radio_config = RadioConfig(
             model_name=model_name,
@@ -2735,7 +2732,6 @@ class NemotronH_Nano_VL_V2(
             norm_mean=hf_config.norm_mean,
             norm_std=hf_config.norm_std,
             temporal_patch_dim=temporal_patch_dim,
-            separate_video_embedder=separate_video_embedder,
             **vision_args,
         )
 
