@@ -190,7 +190,9 @@ class NanoNemotronVLVideoPixelInputs(TensorSchema):
     """
 
     type: Literal["pixel_values_videos"]
-    pixel_values_flat: Annotated[torch.Tensor, TensorShape("bvf", 3, "h", "w")]
+    pixel_values_flat: Annotated[
+        torch.Tensor | list[torch.Tensor], TensorShape("bvf", 3, "h", "w")
+    ]
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
     frames_indices: Annotated[torch.Tensor, TensorShape("bvf")]
     frame_duration_ms: Annotated[torch.Tensor, TensorShape("bn")]
@@ -577,8 +579,8 @@ class DynamicResolutionImageTiler:
             "Dynamic resolution is only supported for image media"
         )
         orig_width, orig_height = media.width, media.height
-        closest_patch_height = math.ceil(orig_height / self._patch_size)
-        closest_patch_width = math.ceil(orig_width / self._patch_size)
+        closest_patch_height = round(orig_height / self._patch_size + 0.5)
+        closest_patch_width = round(orig_width / self._patch_size + 0.5)
         patches = closest_patch_height * closest_patch_width
 
         factor = min(
@@ -861,8 +863,7 @@ class BaseNanoNemotronVLProcessor(ABC):
             image_inputs = {}
             return text, image_inputs
 
-        tiler = self.dynamic_tiler
-        if tiler is not None:
+        if tiler := self.dynamic_tiler:
             sans_images = text[0].replace("<image>", "")
             text_prompt_length = len(
                 self.tokenizer(sans_images, add_special_tokens=False).input_ids
@@ -1082,10 +1083,26 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             video_num_patches = torch.tensor(
                 [len(item) for item in pixel_values_lst_video]
             )
-            video_inputs = {
-                "pixel_values_flat_video": input_conditioner(
+            if all(
+                pv.shape[-2:] == pixel_values_lst_video[0].shape[-2:]
+                for pv in pixel_values_lst_video
+            ):
+                # Normalize all frames in one call for efficiency, then
+                # split back into per-video tensors.  batched("video")
+                # requires each list element = one video.
+                normalized = input_conditioner(
                     torch.cat(pixel_values_lst_video), self.norm_mean, self.norm_std
-                ),
+                )
+                nf_list = [len(item) for item in pixel_values_lst_video]
+                pixel_values_flat_video = list(normalized.split(nf_list, dim=0))
+            else:
+                pixel_values_flat_video = [
+                    input_conditioner(pv, self.norm_mean, self.norm_std)
+                    for pv in pixel_values_lst_video
+                ]
+
+            video_inputs = {
+                "pixel_values_flat_video": pixel_values_flat_video,
                 "video_num_patches": video_num_patches,
                 "frames_indices": frames_indices_lst,
                 "frame_duration_ms": torch.tensor(frame_duration_ms_lst),
@@ -1225,6 +1242,11 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
         text_inputs = self.tokenizer(text, add_special_tokens=False)
 
+        # pixel_values_flat_video is a list of per-video tensors that
+        # BatchFeature cannot convert (ragged sizes).  Keep it out of
+        # the BatchFeature constructor and add it afterwards.
+        video_pixel_values = video_inputs.pop("pixel_values_flat_video", None)
+
         combined_inputs = {**text_inputs, **video_inputs, **audio_inputs}
 
         if self.dynamic_tiler is None:
@@ -1237,6 +1259,10 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             # allow images to be exempt from the BatchFeature validation:
             # We will .stack() them in _parse_and_validate_image_input
             batch.update(image_inputs)
+
+        if video_pixel_values is not None:
+            batch["pixel_values_flat_video"] = video_pixel_values
+
         return batch
 
     def get_image_repl(
@@ -1299,6 +1325,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             img_end_token_ids (list[int]): pre-tokenized IMG_END tokens
             img_context_token_ids (list[int]): pre-tokenized IMG_CONTEXT tokens
             video_temporal_patch_size (int): temporal patch size for videos
+            video_prompt_format (int): video prompt format
         """
         # TODO: Add support of frame_duration_ms to be None
         # At preprocessing step we should allow absent / metadata without
@@ -1339,14 +1366,13 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 "timestamps and tokens_per_frame must have the same length"
             )
             frame_separators = [
-                ("\n" if i > 0 else "") +
-                f"Frame {i + 1} sampled at {timestamp:.2f} seconds: "
+                ("\n" if i > 0 else "")
+                + f"Frame {i + 1} sampled at {timestamp:.2f} seconds: "
                 for i, timestamp in enumerate(timestamps)
             ]
         else:
             frame_separators = [
-                ("\n" if i > 0 else "") +
-                f"Frame {i + 1}: "
+                ("\n" if i > 0 else "") + f"Frame {i + 1}: "
                 for i, _ in enumerate(tokens_per_frame)
             ]
 
@@ -1441,8 +1467,7 @@ class NanoNemotronVLProcessingInfo(BaseNanoNemotronVLProcessingInfo):
     def get_data_parser(self):
         target_sr = None
         target_channels = None
-        extractor = self.audio_extractor
-        if extractor is not None:
+        if extractor := self.audio_extractor:
             target_sr = extractor.sampling_rate
             target_channels = 1
 
@@ -1548,22 +1573,20 @@ class NanoNemotronBaseVLMultiModalProcessor(BaseMultiModalProcessor[_I]):
 
             if isinstance(images, ImageEmbeddingItems):
                 feature_size = images.get_feature_size(item_idx)
+            elif tiler := hf_processor.dynamic_tiler:
+                image = images.get(item_idx)
+                feature_size = tiler.get_cached_feature_size(image)
             else:
-                tiler = hf_processor.dynamic_tiler
-                if tiler is not None:
-                    image = images.get(item_idx)
-                    feature_size = tiler.get_cached_feature_size(image)
-                else:
-                    image_size = images.get_image_size(item_idx)
-                    # Extract max_num_tiles from kwargs, default to 12
-                    max_num_tiles = hf_processor_mm_kwargs.get(
-                        "max_num_tiles", hf_processor.max_num_tiles
-                    )
-                    feature_size = hf_processor.get_num_image_tokens(
-                        image_width=image_size.width,
-                        image_height=image_size.height,
-                        max_num_tiles=max_num_tiles,
-                    )
+                image_size = images.get_image_size(item_idx)
+                # Extract max_num_tiles from kwargs, default to 12
+                max_num_tiles = hf_processor_mm_kwargs.get(
+                    "max_num_tiles", hf_processor.max_num_tiles
+                )
+                feature_size = hf_processor.get_num_image_tokens(
+                    image_width=image_size.width,
+                    image_height=image_size.height,
+                    max_num_tiles=max_num_tiles,
+                )
 
             num_patches = None
             local_image_num_patches = image_num_patches
@@ -1637,8 +1660,7 @@ class NanoNemotronVLMultiModalProcessor(
         processor_inputs: ProcessorInputs,
         timing_ctx: TimingContext | None = None,
     ) -> MultiModalInputs:
-        hf_processor_mm_kwargs = processor_inputs.hf_processor_mm_kwargs
-        if hf_processor_mm_kwargs is None:
+        if (hf_processor_mm_kwargs := processor_inputs.hf_processor_mm_kwargs) is None:
             hf_processor_mm_kwargs = {}
 
         use_audio_in_video = bool(
@@ -1658,9 +1680,7 @@ class NanoNemotronVLMultiModalProcessor(
             if not isinstance(prompt, str):
                 prompt = tokenizer.decode(prompt, skip_special_tokens=False)
             if "<video>" in prompt and "This is a video:" not in prompt:
-                prompt = prompt.replace(
-                    "<video>", "This is a video:\n<video>"
-                )
+                prompt = prompt.replace("<video>", "This is a video:\n<video>")
                 processor_inputs.prompt = tokenizer.encode(
                     prompt, add_special_tokens=False
                 )
@@ -1733,12 +1753,8 @@ class NanoNemotronVLMultiModalProcessor(
     ) -> Mapping[str, MultiModalFieldConfig]:
         image_fields = super()._get_mm_fields_config(hf_inputs, hf_processor_mm_kwargs)
         if self.info.supports_video:
-            video_num_patches = hf_inputs.get("video_num_patches", torch.empty(0))
-
             video_fields = dict(
-                pixel_values_flat_video=MultiModalFieldConfig.flat_from_sizes(
-                    "video", video_num_patches
-                ),
+                pixel_values_flat_video=MultiModalFieldConfig.batched("video"),
                 video_num_patches=MultiModalFieldConfig.batched("video"),
                 frames_indices=MultiModalFieldConfig.batched("video"),
                 frame_duration_ms=MultiModalFieldConfig.batched("video"),
@@ -1879,8 +1895,7 @@ class NanoNemotronVLDummyInputsBuilder(BaseDummyInputsBuilder[_I]):
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
         processor = self.info.get_hf_processor()
-        tiler = processor.dynamic_tiler
-        if tiler is not None:
+        if tiler := processor.dynamic_tiler:
             budget = tiler.max_num_tokens_available(text_prompt_length=num_images)
             target_width, target_height = (
                 tiler.width_and_height_for_max_num_tokens_available(budget)
@@ -2000,8 +2015,7 @@ class NanoNemotronVLDummyInputsBuilder(
         else:
             dummy_video = {}
 
-        extractor = self.info.audio_extractor
-        if extractor is not None:
+        if extractor := self.info.audio_extractor:
             num_audios = mm_counts.get("audio", 0)
             audio_overrides = mm_options.get("audio") if mm_options else None
             tokens_per_audio = max(1, seq_len // max(num_audios, 1))
@@ -2079,16 +2093,14 @@ class NemotronH_Nano_VL_V2(
             vit_hidden_size = config.vit_hidden_size
             vision_projection_hidden_size = config.projector_hidden_size
             llm_hidden_size = config.text_config.hidden_size
-            mlp_in_features = (
-                vit_hidden_size * int(round(1 / self.downsample_ratio)) ** 2
-            )
             mlp1 = nn.Sequential(
                 RMSNorm(
-                    hidden_size=mlp_in_features,
+                    hidden_size=vit_hidden_size
+                    * int(round(1 / self.downsample_ratio)) ** 2,
                     eps=1e-5,
                 ),
                 nn.Linear(
-                    mlp_in_features,
+                    vit_hidden_size * int(round(1 / self.downsample_ratio)) ** 2,
                     vision_projection_hidden_size,
                     bias=False,
                 ),
@@ -2250,22 +2262,13 @@ class NemotronH_Nano_VL_V2(
     def _parse_and_validate_image_input(
         self, **kwargs: object
     ) -> NanoNemotronVLImageInputs | None:
-        image_embeds = kwargs.pop("image_embeds", None)
-        if image_embeds:
+        if image_embeds := kwargs.pop("image_embeds", None):
             return NanoNemotronVLImageEmbeddingInputs(
                 type="image_embeds",
                 data=image_embeds,
             )
 
-        has_static = "image_num_patches" in kwargs
-        has_dynamic = "imgs_sizes" in kwargs and "num_tokens_per_image" in kwargs
-        assert has_static != has_dynamic, (
-            "Expected either static or dynamic resolution in batch, "
-            f"but got keys={list(kwargs.keys())} indicating both"
-        )
-
-        if has_dynamic:
-            assert self.dynamic_resolution
+        if self.dynamic_resolution:
             pixel_values_flat = DynamicResolutionImageTiler.stack(
                 kwargs.pop("pixel_values_flat"), self.patch_size
             )
@@ -2327,24 +2330,35 @@ class NemotronH_Nano_VL_V2(
         downsample_ratio = self.config.downsample_ratio
         patch_size = self.config.patch_size
         pixel_values = video_input["pixel_values_flat"]
-        frame_h, frame_w = pixel_values.shape[-2], pixel_values.shape[-1]
-        rows = int(frame_h * downsample_ratio // patch_size)
-        cols = int(frame_w * downsample_ratio // patch_size)
         video_pruning_rate = self.video_pruning_rate
         video_num_frames = video_input["num_patches"].tolist()
         video_frames_indices = video_input["frames_indices"].split(video_num_frames)
-        # Calculate video feature dimensions (number of frames and
-        # their feature size (AKA tokens per frame))
-        # TODO: Maybe this can be optimized to avoid the loop?
+
+        # When pixel_values is a tensor all videos share the same H,W;
+        # when it's a list (batched requests) each video may differ.
+        is_list = not torch.is_tensor(pixel_values)
+
         for i, single_video_embeddings in enumerate(video_embeddings):
-            original_num_frames = video_num_frames[i]
-            original_frames_indices = video_frames_indices[i].tolist()
+            num_frames = video_num_frames[i]
+            frames_indices = video_frames_indices[i].tolist()
             frame_duration_ms = video_input["frame_duration_ms"][i].item()
 
-            num_tubelets = (
-                math.ceil(original_num_frames / T) if T > 1 else original_num_frames
-            )
-            assert single_video_embeddings.shape[0] % num_tubelets == 0
+            pv = pixel_values[i] if is_list else pixel_values
+            frame_h, frame_w = pv.shape[-2], pv.shape[-1]
+            rows = int(frame_h * downsample_ratio // patch_size)
+            cols = int(frame_w * downsample_ratio // patch_size)
+
+            num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
+            if single_video_embeddings.shape[0] % num_tubelets != 0:
+                raise ValueError(
+                    f"Video {i}: embeddings shape[0]="
+                    f"{single_video_embeddings.shape[0]} not divisible by "
+                    f"num_tubelets={num_tubelets} "
+                    f"(num_frames={num_frames}, T={T}, "
+                    f"pixel_values.shape={pixel_values.shape}, "
+                    f"video_num_frames={video_num_frames}, "
+                    f"num_patches_raw={video_input['num_patches']})"
+                )
 
             if video_pruning_rate is not None and video_pruning_rate > 0.0:
                 # Start of EVS-specific code
@@ -2372,7 +2386,7 @@ class NemotronH_Nano_VL_V2(
                 self._create_final_video_embeddings(
                     single_video_embeddings,
                     num_tokens_per_frame,
-                    original_frames_indices,
+                    frames_indices,
                     frame_duration_ms,
                     video_temporal_patch_size=T,
                 ),
@@ -2392,12 +2406,16 @@ class NemotronH_Nano_VL_V2(
         pixel_values = video_input["pixel_values_flat"]
         num_frames_per_video = video_input["num_patches"].tolist()
         hidden_size = self.config.text_config.hidden_size
+        is_list = not torch.is_tensor(pixel_values)
 
         results: list[torch.Tensor] = []
         frame_offset = 0
-        for nf in num_frames_per_video:
-            video_frames = pixel_values[frame_offset : frame_offset + nf]
-            frame_offset += nf
+        for i, nf in enumerate(num_frames_per_video):
+            if is_list:
+                video_frames = pixel_values[i]
+            else:
+                video_frames = pixel_values[frame_offset : frame_offset + nf]
+                frame_offset += nf
 
             vit_embeds = self.extract_feature(video_frames, num_frames=nf)
             results.append(vit_embeds.view(-1, hidden_size))
@@ -2537,19 +2555,31 @@ class NemotronH_Nano_VL_V2(
                     [f.flatten() for f in frame_duration_ms], dim=0
                 )
 
+            if (
+                torch.is_tensor(pixel_values_flat_video)
+                and pixel_values_flat_video.ndim == 5
+            ):
+                # batched._reduce_data stacked same-shape videos into
+                # [num_videos, nf, 3, H, W]; unstack back to a list so the
+                # same-H,W cat path below handles it uniformly.
+                pixel_values_flat_video = list(pixel_values_flat_video)
+
             if not torch.is_tensor(pixel_values_flat_video):
-                if not all(
+                if all(
                     t.shape[-2] == pixel_values_flat_video[0].shape[-2]
                     and t.shape[-1] == pixel_values_flat_video[0].shape[-1]
                     for t in pixel_values_flat_video
                 ):
-                    raise NotImplementedError(
-                        "Batched video inference with different spatial"
-                        " dimensions is not yet supported. To process a batch of videos"
-                        " with different spatial dimensions, process one video at a"
-                        " time."
+                    pixel_values_flat_video = torch.cat(pixel_values_flat_video, dim=0)
+                else:
+                    return NanoNemotronVLVideoPixelInputs(
+                        type="pixel_values_videos",
+                        pixel_values_flat=pixel_values_flat_video,
+                        num_patches=video_num_patches,
+                        frames_indices=frames_indices,
+                        frame_duration_ms=frame_duration_ms,
+                        validate=False,
                     )
-                pixel_values_flat_video = torch.cat(pixel_values_flat_video, dim=0)
 
             expected_h = pixel_values_flat_video.shape[-2]
             expected_w = pixel_values_flat_video.shape[-1]
@@ -2719,11 +2749,14 @@ class NemotronH_Nano_VL_V2(
         image_size = preferred_resolution[0] if preferred_resolution else 224
         patch_size = getattr(hf_config_vision, "patch_size", 16)
 
-        vision_args = dict(hf_config_vision.args)
-        vision_args.pop("temporal_patch_dim", None)
-        vision_args.pop("separate_video_embedder", None)
-
-        temporal_patch_dim = getattr(hf_config_vision, "video_temporal_patch_size", 1)
+        # video_temporal_patch_size and separate_video_embedder are
+        # top-level vision_config attributes, not inside args.
+        video_temporal_patch_size = getattr(
+            hf_config_vision, "video_temporal_patch_size", 1
+        )
+        separate_video_embedder = getattr(
+            hf_config_vision, "separate_video_embedder", True
+        )
 
         radio_config = RadioConfig(
             model_name=model_name,
@@ -2731,8 +2764,9 @@ class NemotronH_Nano_VL_V2(
             patch_size=patch_size,
             norm_mean=hf_config.norm_mean,
             norm_std=hf_config.norm_std,
-            temporal_patch_dim=temporal_patch_dim,
-            **vision_args,
+            video_temporal_patch_size=video_temporal_patch_size,
+            separate_video_embedder=separate_video_embedder,
+            **hf_config_vision.args,
         )
 
         return RadioModel(config=radio_config)
