@@ -590,7 +590,7 @@ class RadioInternVisionModel(nn.Module):
         max_img_size = int(
             round(config.cpe_max_size / config.patch_size) * config.patch_size
         )
-        self.temporal_patch_size = getattr(config, "temporal_patch_size", 1)
+        self.temporal_patch_size = config.video_temporal_patch_size
         unique_teachers = set(t["name"] for t in config.teachers)
         self.patch_generator = ViTPatchGenerator(
             config.patch_size,
@@ -679,7 +679,6 @@ class RadioInternVisionModel(nn.Module):
             mask_meta = self._inter_image_mask_metadata_from_seq_lens(
                 [seq_per_tubelet] * packed_batch_size, device=hidden_states.device
             )
-
         elif effective_sizes is not None and len(effective_sizes) > 1:
             # Dynamic-res images/tubelets: variable sequence lengths.
             # hidden_states is already [1, total_seq, hidden] from the
