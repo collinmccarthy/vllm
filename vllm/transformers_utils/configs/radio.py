@@ -105,6 +105,6 @@ class RadioConfig(PretrainedConfig):
         self.register_multiple = register_multiple
         self.teachers = teachers if teachers is not None else []
         self.cls_token_per_teacher = cls_token_per_teacher
-        self.temporal_patch_size = video_temporal_patch_size
+        self.video_temporal_patch_size = video_temporal_patch_size
         self.separate_video_embedder = separate_video_embedder
         super().__init__(**kwargs)
