@@ -49,10 +49,8 @@ class RadioConfig(PretrainedConfig):
         cls_token_per_teacher: Whether to use a separate CLS token for each teacher.
         temporal_patch_dim: Number of consecutive video frames grouped into
             a single tubelet for temporal compression. Default 1 (no compression).
-        separate_video_embedder: When True and temporal_patch_dim > 1, use a
-            dedicated video patch embedder (3*T*P*P -> hidden) separate from the
-            image embedder (3*P*P -> hidden). When False, a single embedder with
-            input size 3*T*P*P is used for both (images are duplicated T times).
+            When > 1, a dedicated video_embedder (3*T*P*P -> hidden) is created
+            alongside the image embedder (3*P*P -> hidden).
     """
 
     model_type = "radio"
@@ -75,7 +73,6 @@ class RadioConfig(PretrainedConfig):
         teachers: list[dict[str, Any]] | None = None,
         cls_token_per_teacher: bool = False,
         temporal_patch_dim: int = 1,
-        separate_video_embedder: bool = False,
         **kwargs,
     ):
         self.model_name = model_name
@@ -104,5 +101,4 @@ class RadioConfig(PretrainedConfig):
         self.teachers = teachers if teachers is not None else []
         self.cls_token_per_teacher = cls_token_per_teacher
         self.temporal_patch_dim = temporal_patch_dim
-        self.separate_video_embedder = separate_video_embedder
         super().__init__(**kwargs)
