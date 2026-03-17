@@ -962,7 +962,9 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
         # Video params live exclusively in vision_config
         vision_config = getattr(config, "vision_config", config)
-        self.video_temporal_patch_size: int = vision_config.video_temporal_patch_size
+        self.video_temporal_patch_size: int = getattr(
+            vision_config, "video_temporal_patch_size", 1
+        )
         self.video_maintain_aspect_ratio: bool = getattr(
             vision_config, "video_maintain_aspect_ratio", False
         )
@@ -2049,7 +2051,9 @@ class NemotronH_Nano_VL_V2(
         self.video_pruning_rate = multimodal_config.video_pruning_rate
 
         vision_config = getattr(config, "vision_config", config)
-        self.video_temporal_patch_size: int = vision_config.video_temporal_patch_size
+        self.video_temporal_patch_size: int = getattr(
+            vision_config, "video_temporal_patch_size", 1
+        )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
