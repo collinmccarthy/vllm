@@ -151,6 +151,7 @@ def _compute_aspect_preserving_size(
     target_num_patches: int,
     patch_size: int,
     downsample_ratio: float,
+    round_down: bool = False,
 ) -> tuple[int, int]:
     """Compute target pixel dimensions that preserve aspect ratio.
 
@@ -159,13 +160,15 @@ def _compute_aspect_preserving_size(
     according to the source aspect ratio, then snapped to a multiple of
     the required divisor (2 for pixel-shuffle).
     """
+    round_fn = math.floor if round_down else round
+
     aspect_wh = orig_w / max(orig_h, 1)
-    ph = round(math.sqrt(target_num_patches / aspect_wh))
-    pw = round(math.sqrt(target_num_patches * aspect_wh))
+    ph = round_fn(math.sqrt(target_num_patches / aspect_wh))
+    pw = round_fn(math.sqrt(target_num_patches * aspect_wh))
     ph = max(ph, 1)
     pw = max(pw, 1)
 
-    reduction_factor = int(round(1 / downsample_ratio))
+    reduction_factor = int(round(1 / downsample_ratio))  # Always `round`
     required_divisor = reduction_factor  # 2 for pixel-shuffle
     if required_divisor > 1:
         rem_h = ph % required_divisor
@@ -174,7 +177,8 @@ def _compute_aspect_preserving_size(
         ph_down = ph - rem_h
         pw_up = pw + (required_divisor - rem_w if rem_w else 0)
         pw_down = pw - rem_w
-        if ph_up * pw_up <= target_num_patches:
+        if ph_up * pw_up <= target_num_patches and not round_down:
+            # Can't "snap up" if rounding down, can still be > max_feature_size
             ph, pw = ph_up, pw_up
         else:
             ph = max(required_divisor, ph_down)
@@ -190,30 +194,42 @@ def get_video_target_size_and_feature_size(
     maintain_aspect_ratio: bool,
     patch_size: int,
     downsample_ratio: float,
+    max_feature_size: int | None = None,
 ) -> tuple[int, int, int]:
     """Compute target (width, height) and feature_size for video resize and token count.
 
     Used by video_to_pixel_values (resize) and get_video_replacement_internvl
     (seq length calc) so both use the same dimensions.
     """
+    _calc_feature_size = lambda target_w, target_h: (
+        int((target_h // patch_size) * downsample_ratio)
+        * int((target_w // patch_size) * downsample_ratio)
+    )
+
     if maintain_aspect_ratio:
-        target_w, target_h = _compute_aspect_preserving_size(
-            orig_w=orig_w,
-            orig_h=orig_h,
-            target_num_patches=target_patches,
-            patch_size=patch_size,
-            downsample_ratio=downsample_ratio,
-        )
+        # During dummy pass, round up
+        # During forward pass, try to round up, and if over-budget, round down
+        #  (this can happen for extreme aspect ratios, don't want to return 400 error)
+        round_down_vals = [False] if max_feature_size is None else [False, True]
+        for round_down in round_down_vals:
+            target_w, target_h = _compute_aspect_preserving_size(
+                orig_w=orig_w,
+                orig_h=orig_h,
+                target_num_patches=target_patches,
+                patch_size=patch_size,
+                downsample_ratio=downsample_ratio,
+                round_down=round_down,
+            )
+            feature_size = _calc_feature_size(target_w, target_h)
+            if max_feature_size is None or feature_size <= max_feature_size:
+                break
     else:
         reduction_factor = int(round(1 / downsample_ratio))
         side = int(math.sqrt(target_patches))
         side = max(reduction_factor, (side // reduction_factor) * reduction_factor)
         target_w = side * patch_size
         target_h = side * patch_size
-
-    feature_size = int((target_h // patch_size) * downsample_ratio) * int(
-        (target_w // patch_size) * downsample_ratio
-    )
+        feature_size = _calc_feature_size(target_w, target_h)
     return target_w, target_h, feature_size
 
 
@@ -225,6 +241,7 @@ def video_to_pixel_values(
     video_maintain_aspect_ratio: bool = False,
     patch_size: int = 16,
     downsample_ratio: float = 0.5,
+    max_feature_size: int | None = None,
 ) -> torch.Tensor:
     # (num_frames, H, W, C) -> (num_frames, C, H, W)
     video_tensor = torch.from_numpy(video).permute(0, 3, 1, 2)
@@ -239,6 +256,7 @@ def video_to_pixel_values(
             maintain_aspect_ratio=video_maintain_aspect_ratio,
             patch_size=patch_size,
             downsample_ratio=downsample_ratio,
+            max_feature_size=max_feature_size,
         )
         if video_tensor.shape[2] != target_h or video_tensor.shape[3] != target_w:
             video_tensor = torch.nn.functional.interpolate(
@@ -850,21 +868,41 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
     def num_video_token(self) -> int:
         """Token count per video frame, accounting for video_target_num_patches.
 
-        When video_target_num_patches is set the per-frame feature count
-        differs from the image-based num_image_token.  We use a square
-        dummy (1:1) to compute the feature_size because the dummy video is
-        square and the user confirmed that is acceptable.
+        The budget is ``ceil(target_patches * downsample_ratio ** 2)``.
+        This is the worst-case feature_size across all aspect ratios:
+        some ratios (e.g. 2:1 at T=512) tile exactly to target_patches
+        with both dims already even, giving ph*pw == T and thus
+        feature_size == T * downsample_ratio**2.
+
+        The forward-pass cap (round_down=True) guarantees that the actual
+        feature_size never exceeds this bound, since floor + forced
+        snap-down keeps ph*pw <= T. In equations (tested w/ separate script):
+
+        Given
+            target_w = pw * patch_size, target_h = ph * patch_size
+        And
+            feature_size = int((target_h // patch_size) * downsample_ratio) *
+                int((target_w // patch_size) * downsample_ratio)
+        Then
+            feature_size = (ph * downsample_ratio) * (pw * downsample_ratio)
+            feature_size = (ph * pw * downsample_ratio**2)
+
+        So if we want
+            ph * pw <= target_num_patches
+        Then
+            feature_size <= (target_num_patches * downsample_ratio**2)
+        Thus
+            max_feature_size = (target_num_patches * downsample_ratio**2)
+
+        Technical nit: we dropped int() above b/c we round target_h, target_w to
+        multiples of reduction_factor (= 1/downsample_ratio), so the int() is a no-op
+        in the end. This also means we have to use round_down=True in the forward pass
+        to always guarantee feature_size <= max_feature_size.
         """
         if self.video_target_num_patches is not None:
-            _, _, feature_size = get_video_target_size_and_feature_size(
-                orig_w=self.image_size,
-                orig_h=self.image_size,
-                target_patches=self.video_target_num_patches,
-                maintain_aspect_ratio=self.video_maintain_aspect_ratio,
-                patch_size=self.config.patch_size,
-                downsample_ratio=self.config.downsample_ratio,
+            return math.ceil(
+                self.video_target_num_patches * self.config.downsample_ratio**2
             )
-            return feature_size
         return self.num_image_token
 
     @property
@@ -893,6 +931,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
                 patch_size=self.config.patch_size,
                 downsample_ratio=self.config.downsample_ratio,
+                max_feature_size=self.num_video_token,
             )
             for video in videos
         ]

@@ -442,6 +442,7 @@ class NanoNemotronVLMultiModalProcessor(
                     maintain_aspect_ratio=hf_processor.video_maintain_aspect_ratio,
                     patch_size=patch_size,
                     downsample_ratio=downsample_ratio,
+                    max_feature_size=hf_processor.num_video_token,
                 )
             else:
                 feature_size = hf_processor.num_image_token
