@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -49,6 +50,21 @@ DEFAULT_NUM_TILES = 12
 Image.MAX_IMAGE_PIXELS = None  # Disable the limit entirely
 # Alternative: Set a specific higher limit
 # Image.MAX_IMAGE_PIXELS = 300000000  # ~300M pixels
+
+
+def video_budget_debug_enabled() -> bool:
+    value = os.getenv("NANO_NEMOTRON_VL_VIDEO_DEBUG", "0").strip().lower()
+    return value not in ("", "0", "false", "off", "no")
+
+
+def video_budget_debug_print(stage: str, **fields: Any) -> None:
+    if not video_budget_debug_enabled():
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(
+        f"[NANO_NEMOTRON_VL_VIDEO_DEBUG][{stage}] {details}",
+        flush=True,
+    )
 
 
 def calculate_timestamps(
@@ -215,6 +231,33 @@ def get_video_target_size_and_feature_size(
         (target_w // patch_size) * downsample_ratio
     )
     return target_w, target_h, feature_size
+
+
+def get_native_video_size_and_patch_count(
+    orig_w: int,
+    orig_h: int,
+    patch_size: int,
+    downsample_ratio: float,
+) -> tuple[int, int, int]:
+    """Return the largest patch-aligned size that does not upscale the frame."""
+    reduction_factor = int(round(1 / downsample_ratio))
+    grid_w = max(orig_w // patch_size, 1)
+    grid_h = max(orig_h // patch_size, 1)
+
+    if reduction_factor > 1:
+        if grid_w >= reduction_factor:
+            grid_w = max(
+                reduction_factor, (grid_w // reduction_factor) * reduction_factor
+            )
+        if grid_h >= reduction_factor:
+            grid_h = max(
+                reduction_factor, (grid_h // reduction_factor) * reduction_factor
+            )
+
+    target_w = grid_w * patch_size
+    target_h = grid_h * patch_size
+    native_patch_count = grid_h * grid_w
+    return target_w, target_h, native_patch_count
 
 
 def video_to_pixel_values(
@@ -793,6 +836,8 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         max_num_tiles: int | None = None,
         video_token: str | None = None,
         video_pruning_rate: float | None = None,
+        video_native_res_patches_budget: int | None = None,
+        video_min_patches_per_frame: int | None = None,
     ) -> None:
         super().__init__(
             config=config,
@@ -830,6 +875,22 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             self.video_target_num_patches = base_patches * base_patches
         else:
             self.video_target_num_patches = None
+        config_video_native_res_patches_budget = getattr(
+            vision_config, "video_native_res_patches_budget", None
+        )
+        config_video_min_patches_per_frame = getattr(
+            vision_config, "video_min_patches_per_frame", 256
+        )
+        self.video_native_res_patches_budget: int | None = (
+            config_video_native_res_patches_budget
+            if video_native_res_patches_budget is None
+            else video_native_res_patches_budget
+        )
+        self.video_min_patches_per_frame: int = (
+            config_video_min_patches_per_frame
+            if video_min_patches_per_frame is None
+            else video_min_patches_per_frame
+        )
 
         self.audio_extractor: ParakeetExtractor | None = None
         raw_sound_config = getattr(config, "sound_config", None)
@@ -867,6 +928,52 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             return feature_size
         return self.num_image_token
 
+    def get_video_target_num_patches_for_num_frames(
+        self,
+        *,
+        orig_w: int,
+        orig_h: int,
+        num_frames: int,
+    ) -> int | None:
+        if self.video_native_res_patches_budget is not None:
+            budget_per_frame = max(
+                self.video_min_patches_per_frame,
+                self.video_native_res_patches_budget // max(num_frames, 1),
+            )
+            _, _, native_patch_count = get_native_video_size_and_patch_count(
+                orig_w=orig_w,
+                orig_h=orig_h,
+                patch_size=self.config.patch_size,
+                downsample_ratio=self.config.downsample_ratio,
+            )
+            return min(budget_per_frame, native_patch_count)
+
+        return self.video_target_num_patches
+
+    def get_video_target_size_and_feature_size_for_num_frames(
+        self,
+        *,
+        orig_w: int,
+        orig_h: int,
+        num_frames: int,
+    ) -> tuple[int, int, int] | None:
+        target_num_patches = self.get_video_target_num_patches_for_num_frames(
+            orig_w=orig_w,
+            orig_h=orig_h,
+            num_frames=num_frames,
+        )
+        if target_num_patches is None:
+            return None
+
+        return get_video_target_size_and_feature_size(
+            orig_w=orig_w,
+            orig_h=orig_h,
+            target_patches=target_num_patches,
+            maintain_aspect_ratio=self.video_maintain_aspect_ratio,
+            patch_size=self.config.patch_size,
+            downsample_ratio=self.config.downsample_ratio,
+        )
+
     @property
     def supports_video(self) -> bool:
         return self.video_token_id is not None
@@ -885,17 +992,24 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         self,
         videos: list[npt.NDArray],
     ) -> list[torch.Tensor]:
-        return [
-            video_to_pixel_values(
-                video,
-                input_size=self.image_size,
-                video_target_num_patches=self.video_target_num_patches,
-                video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
-                patch_size=self.config.patch_size,
-                downsample_ratio=self.config.downsample_ratio,
+        pixel_values_lst = []
+        for video in videos:
+            target_num_patches = self.get_video_target_num_patches_for_num_frames(
+                orig_w=video.shape[2],
+                orig_h=video.shape[1],
+                num_frames=video.shape[0],
             )
-            for video in videos
-        ]
+            pixel_values_lst.append(
+                video_to_pixel_values(
+                    video,
+                    input_size=self.image_size,
+                    video_target_num_patches=target_num_patches,
+                    video_maintain_aspect_ratio=self.video_maintain_aspect_ratio,
+                    patch_size=self.config.patch_size,
+                    downsample_ratio=self.config.downsample_ratio,
+                )
+            )
+        return pixel_values_lst
 
     def _preprocess_video(
         self,
@@ -938,7 +1052,14 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
         T = self.video_temporal_patch_size
 
-        for pixel_values, video_metadata, frames_indices, frame_duration_ms in zip(
+        for (
+            video,
+            pixel_values,
+            video_metadata,
+            frames_indices,
+            frame_duration_ms,
+        ) in zip(
+            videos_lst,
             pixel_values_lst_video,
             video_metadata_lst,
             frames_indices_lst,
@@ -948,6 +1069,40 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             frame_h, frame_w = pixel_values.shape[-2], pixel_values.shape[-1]
             tokens_in_single_frame = int(
                 (frame_h * frame_w // patch_size**2) * (downsample_ratio**2)
+            )
+            video_metadata["resolved_video_feature_size"] = tokens_in_single_frame
+            resolved_num_patches_per_frame = (frame_h // patch_size) * (
+                frame_w // patch_size
+            )
+            video_metadata["resolved_video_frame_size"] = (frame_h, frame_w)
+            video_metadata["resolved_video_num_patches_per_frame"] = (
+                resolved_num_patches_per_frame
+            )
+            video_metadata["resolved_video_total_patches"] = (
+                resolved_num_patches_per_frame * num_frames
+            )
+            video_metadata["resolved_video_num_frames"] = num_frames
+
+            orig_h, orig_w = video.shape[1], video.shape[2]
+            target_num_patches = self.get_video_target_num_patches_for_num_frames(
+                orig_w=orig_w,
+                orig_h=orig_h,
+                num_frames=num_frames,
+            )
+            video_budget_debug_print(
+                "processor_preprocess_video",
+                orig_resolution=f"{orig_w}x{orig_h}",
+                video_length_s=video_metadata.get("duration"),
+                original_fps=video_metadata.get("fps"),
+                original_total_frames=video_metadata.get("total_num_frames"),
+                sampled_num_frames=num_frames,
+                new_resolution=f"{frame_w}x{frame_h}",
+                new_num_frames=num_frames,
+                new_num_patches_per_frame=resolved_num_patches_per_frame,
+                new_total_patches=resolved_num_patches_per_frame * num_frames,
+                target_num_patches_per_frame=target_num_patches,
+                total_budget=self.video_native_res_patches_budget,
+                min_patches_per_frame=self.video_min_patches_per_frame,
             )
             num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
 

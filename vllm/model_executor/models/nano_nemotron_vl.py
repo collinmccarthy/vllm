@@ -88,7 +88,7 @@ from vllm.transformers_utils.processors.nano_nemotron_vl import (
     BaseNanoNemotronVLProcessor,
     DynamicResolutionImageTiler,
     NanoNemotronVLProcessor,
-    get_video_target_size_and_feature_size,
+    video_budget_debug_print,
 )
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
@@ -198,13 +198,24 @@ NanoNemotronVLVideoInputs: TypeAlias = (
 
 
 class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
+    def get_video_media_io_kwargs(self) -> Mapping[str, object]:
+        video_kwargs = self.ctx.get_mm_config().media_io_kwargs.get("video", {})
+        return video_kwargs
+
     def get_hf_processor(self, **kwargs: object) -> NanoNemotronVLProcessor:
+        video_media_io_kwargs = self.get_video_media_io_kwargs()
         return self.ctx.init_processor(
             NanoNemotronVLProcessor,
             config=self.get_hf_config(),
             tokenizer=self.get_tokenizer(),
             video_token=self.get_video_token(),
             video_pruning_rate=self.get_video_pruning_rate(),
+            video_native_res_patches_budget=video_media_io_kwargs.get(
+                "video_native_res_patches_budget"
+            ),
+            video_min_patches_per_frame=video_media_io_kwargs.get(
+                "video_min_patches_per_frame"
+            ),
             max_model_len=self.ctx.model_config.max_model_len,
             **kwargs,
         )
@@ -299,6 +310,29 @@ class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
 
         max_image_tokens = self.get_max_image_tokens() * max_images
         tokens_per_tubelet = processor.num_video_token
+        if processor.video_native_res_patches_budget is not None:
+            video_num_frames = self.get_video_media_io_kwargs().get("num_frames")
+            if isinstance(video_num_frames, int) and video_num_frames > 0:
+                reduction_factor = int(round(1 / processor.config.downsample_ratio))
+                budget_per_frame = processor.video_native_res_patches_budget // max(
+                    video_num_frames, 1
+                )
+                large_native_grid = int(math.ceil(math.sqrt(budget_per_frame)))
+                if reduction_factor > 1:
+                    large_native_grid = (
+                        int(math.ceil(large_native_grid / reduction_factor))
+                        * reduction_factor
+                    )
+                profile_orig_dim = large_native_grid * processor.config.patch_size
+                resolved = (
+                    processor.get_video_target_size_and_feature_size_for_num_frames(
+                        orig_w=profile_orig_dim,
+                        orig_h=profile_orig_dim,
+                        num_frames=video_num_frames,
+                    )
+                )
+                if resolved is not None:
+                    tokens_per_tubelet = resolved[2]
         max_total_tubelets = (seq_len - max_image_tokens) // tokens_per_tubelet
         max_tubelets_per_video = max_total_tubelets // max(max_videos, 1)
         max_frames_per_video = max_tubelets_per_video * T
@@ -430,21 +464,8 @@ class NanoNemotronVLMultiModalProcessor(
 
         def get_video_replacement(item_idx: int):
             video, metadata = mm_items["video"][item_idx]
-            patch_size = hf_processor.config.patch_size
-            downsample_ratio = hf_processor.config.downsample_ratio
-            target_patches = hf_processor.video_target_num_patches
-
-            if target_patches is not None and video is not None and video.shape[0] > 0:
-                orig_h, orig_w = video.shape[1], video.shape[2]
-                _, _, feature_size = get_video_target_size_and_feature_size(
-                    orig_w=orig_w,
-                    orig_h=orig_h,
-                    target_patches=target_patches,
-                    maintain_aspect_ratio=hf_processor.video_maintain_aspect_ratio,
-                    patch_size=patch_size,
-                    downsample_ratio=downsample_ratio,
-                )
-            else:
+            feature_size = metadata.get("resolved_video_feature_size")
+            if feature_size is None:
                 feature_size = hf_processor.num_image_token
             num_patches = video_num_patches[item_idx]
             if num_patches is not None:
@@ -473,6 +494,24 @@ class NanoNemotronVLMultiModalProcessor(
             else:
                 tokens_per_frame = [feature_size] * num_tubelets
 
+            video_budget_debug_print(
+                "model_prompt_replacement_video",
+                orig_resolution=(
+                    None if video is None else f"{video.shape[2]}x{video.shape[1]}"
+                ),
+                video_length_s=metadata.get("duration"),
+                original_fps=metadata.get("fps"),
+                original_total_frames=metadata.get("total_num_frames"),
+                new_resolution=metadata.get("resolved_video_frame_size"),
+                new_num_frames=metadata.get("resolved_video_num_frames"),
+                new_num_patches_per_frame=metadata.get(
+                    "resolved_video_num_patches_per_frame"
+                ),
+                new_total_patches=metadata.get("resolved_video_total_patches"),
+                feature_size=feature_size,
+                total_budget=hf_processor.video_native_res_patches_budget,
+                min_patches_per_frame=hf_processor.video_min_patches_per_frame,
+            )
             frame_duration_ms = int(1000 / metadata["fps"])
             return hf_processor.get_video_repl(
                 tokens_per_frame=tokens_per_frame,
@@ -720,22 +759,6 @@ class NanoNemotronVLDummyInputsBuilder(
             config = self.info.get_hf_config()
             image_size: int = config.force_image_size
 
-            # When video_target_num_patches is set the per-frame pixel
-            # resolution can exceed image_size.  Use the actual target
-            # dimensions so that profiling sees the correct upper bound.
-            if processor.video_target_num_patches is not None:
-                target_w, target_h, _ = get_video_target_size_and_feature_size(
-                    orig_w=image_size,
-                    orig_h=image_size,
-                    target_patches=processor.video_target_num_patches,
-                    maintain_aspect_ratio=processor.video_maintain_aspect_ratio,
-                    patch_size=config.patch_size,
-                    downsample_ratio=config.downsample_ratio,
-                )
-                video_width, video_height = target_w, target_h
-            else:
-                video_width, video_height = image_size, image_size
-
             target_num_frames = self.info.get_num_frames_with_most_features(
                 seq_len, mm_counts
             )
@@ -745,6 +768,44 @@ class NanoNemotronVLDummyInputsBuilder(
             ):
                 assert num_frames > 0
                 target_num_frames = num_frames
+
+            # When a video patch target or budget is set, the per-frame pixel
+            # resolution can exceed image_size. Use the actual target
+            # dimensions so that profiling sees the correct upper bound.
+            #
+            # Budget mode: get_video_target_num_patches_for_num_frames caps the
+            # per-frame patch count at native_patches(orig_w, orig_h).  Passing
+            # image_size directly gives native_patches(image_size) which can be
+            # smaller than budget//target_num_frames, causing the profiling to
+            # underestimate the per-frame resolution.  Instead, compute the
+            # smallest square dimension whose native patch count is at least
+            # budget_per_frame so the cap never fires during profiling.
+            if processor.video_native_res_patches_budget is not None:
+                reduction_factor = int(round(1 / processor.config.downsample_ratio))
+                budget_per_frame = processor.video_native_res_patches_budget // max(
+                    target_num_frames, 1
+                )
+                large_native_grid = int(math.ceil(math.sqrt(budget_per_frame)))
+                if reduction_factor > 1:
+                    large_native_grid = (
+                        int(math.ceil(large_native_grid / reduction_factor))
+                        * reduction_factor
+                    )
+                profile_orig_dim = large_native_grid * processor.config.patch_size
+            else:
+                profile_orig_dim = image_size
+
+            resolved = processor.get_video_target_size_and_feature_size_for_num_frames(
+                orig_w=profile_orig_dim,
+                orig_h=profile_orig_dim,
+                num_frames=target_num_frames,
+            )
+            if resolved is not None:
+                target_w, target_h, _ = resolved
+                video_width, video_height = target_w, target_h
+            else:
+                video_width, video_height = image_size, image_size
+
             num_videos = mm_counts.get("video", 0)
             video_overrides = mm_options.get("video")
             dummy_video = {
