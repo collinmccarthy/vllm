@@ -300,6 +300,11 @@ class SpeculativeConfig:
                 {"n_predict": n_predict, "architectures": ["ErnieMTPModel"]}
             )
 
+        if hf_config.architectures[0] == "NemotronH_Super_Omni_Reasoning_V3":
+            # NemotronH Super VLM wraps the LLM backbone under llm_config.
+            # Promote it so MTP draft-model detection below fires correctly.
+            hf_config = hf_config.llm_config
+
         if (
             hf_config.model_type in {"nemotron_h", "nemotron_h_puzzle"}
             and hasattr(hf_config, "num_nextn_predict_layers")
