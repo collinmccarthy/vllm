@@ -777,9 +777,6 @@ class RadioModel(nn.Module):
                 if len(parts) >= 4:
                     layer_idx = parts[2]
                     suffix = ".".join(parts[3:])
-                    # Skip layer-scale entries that vLLM doesn't use
-                    if suffix in {"ls1", "ls2"} or suffix.startswith(("ls1.", "ls2.")):
-                        continue
                     vllm_key = f"model.encoder.layers.{layer_idx}.{suffix}"
 
             if vllm_key and vllm_key in params_dict:
@@ -787,6 +784,17 @@ class RadioModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
                 loaded_params.add(vllm_key)
+
+        # ls1/ls2 may be absent from HF checkpoints if layer-scale gammas have
+        # been folded into attn.proj/mlp.fc2 weights at export time.  In that
+        # case they must be 1.0 (identity) so the folded weights compute
+        # correctly.  Explicitly set them here so that dummy-init values used
+        # in RL training pipelines do not corrupt inference.
+        initializer_factor = getattr(self.config, "initializer_factor", 1.0)
+        for pname, param in params_dict.items():
+            if (pname.endswith(".ls1") or pname.endswith(".ls2")) and pname not in loaded_params:
+                with torch.no_grad():
+                    param.fill_(initializer_factor)
 
         return loaded_params
 
