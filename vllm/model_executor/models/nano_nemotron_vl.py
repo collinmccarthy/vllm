@@ -660,6 +660,29 @@ class NanoNemotronVLMultiModalProcessor(
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
     ) -> MultiModalInput:
+        import os
+        if os.environ.get("VLLM_PROMPT_DEBUG") == "1":
+            # inputs.prompt is the full post-chat-template string (or token IDs
+            # if pre-tokenized). Decode if necessary to log the actual rendered
+            # prompt that will be handed to the multimodal pipeline.
+            raw_prompt = inputs.prompt
+            if isinstance(raw_prompt, str):
+                prompt_text = raw_prompt
+            else:
+                try:
+                    prompt_text = self.info.get_tokenizer().decode(
+                        raw_prompt, skip_special_tokens=False
+                    )
+                except Exception as _e:
+                    prompt_text = f"<decode-failed: {_e!r} raw={raw_prompt!r:.200}>"
+            mm_keys = list(inputs.mm_data_items.keys()) if inputs.mm_data_items else []
+            print(
+                f"[PROMPT_DEBUG apply] POST-CHAT-TEMPLATE full prompt "
+                f"(mm_keys={mm_keys} len={len(prompt_text)} chars):\n"
+                f"{prompt_text!r}",
+                flush=True,
+            )
+
         mm_config = self.info.ctx.model_config.get_multimodal_config()
         merged_kwargs = mm_config.merge_mm_processor_kwargs(
             inputs.hf_processor_mm_kwargs
@@ -711,6 +734,12 @@ class NanoNemotronVLMultiModalProcessor(
         if not isinstance(prompt, str):
             prompt = tokenizer.decode(prompt, skip_special_tokens=False)
 
+        if os.environ.get("VLLM_PROMPT_DEBUG") == "1":
+            print(
+                f"[PROMPT_DEBUG apply] PRE-AUDIO-INJECT prompt "
+                f"(len={len(prompt)}, has_audio={has_audio}):\n{prompt!r}",
+                flush=True,
+            )
         # Inject AUDIO_CONTEXT only after <video> tokens whose video
         # actually contained an audio stream (preserving video-audio pairing).
         tag = "<video>"
@@ -722,6 +751,12 @@ class NanoNemotronVLMultiModalProcessor(
                 rebuilt.append(AUDIO_CONTEXT)
             rebuilt.append(part)
         prompt = "".join(rebuilt)
+        if os.environ.get("VLLM_PROMPT_DEBUG") == "1":
+            print(
+                f"[PROMPT_DEBUG apply] POST-AUDIO-INJECT final prompt "
+                f"(len={len(prompt)}):\n{prompt!r}",
+                flush=True,
+            )
 
         inputs.prompt = tokenizer.encode(prompt, add_special_tokens=False)
 

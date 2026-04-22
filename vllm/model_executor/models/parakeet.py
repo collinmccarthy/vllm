@@ -4,6 +4,7 @@
 Modules below used for the audio encoder component in: models/nano_nemotron_vl.py
 """
 
+import os
 from collections.abc import Iterable
 from functools import cache
 from typing import Any
@@ -266,6 +267,17 @@ class ParakeetExtractor:
         *,
         device: str = "cpu",
     ) -> dict[str, Any]:
+        _audio_debug = os.environ.get("VLLM_AUDIO_DEBUG", "0") not in ("0", "", "false", "False")
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG ParakeetExtractor] sampling_rate={self.config.sampling_rate} "
+                f"hop_length={self.config.hop_length} "
+                f"subsampling_factor={self.config.subsampling_factor} "
+                f"num_mel_bins={self.config.num_mel_bins} "
+                f"num_raw_audios={len(raw_speech)}",
+                flush=True,
+            )
+
         raw_speech = [
             torch.as_tensor(speech, device=device, dtype=torch.float32)
             for speech in raw_speech
@@ -294,11 +306,41 @@ class ParakeetExtractor:
 
         max_length = max(len(speech) for speech in raw_speech)
         input_features = self._pad_raw_speech(raw_speech, max_length, device)
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG ParakeetExtractor] post_pad shape={tuple(input_features.shape)} "
+                f"audio_lengths={audio_lengths.tolist()} "
+                f"audio_num_clips={audio_num_clips}",
+                flush=True,
+            )
         input_features = self._apply_preemphasis(input_features, audio_lengths)
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG ParakeetExtractor] post_preemphasis shape={tuple(input_features.shape)} "
+                f"sum={float(input_features.sum()):.5f} mean={float(input_features.mean()):.5f} "
+                f"first5={input_features.flatten()[:5].tolist()}",
+                flush=True,
+            )
         input_features = self._torch_extract_fbank_features(input_features, device)
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG ParakeetExtractor] post_fbank shape={tuple(input_features.shape)} "
+                f"sum={float(input_features.sum()):.5f} mean={float(input_features.mean()):.5f} "
+                f"first5={input_features.flatten()[:5].tolist()}",
+                flush=True,
+            )
         input_features, attention_mask = self._normalize_mel_features(
             input_features, audio_lengths
         )
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG ParakeetExtractor] post_normalize shape={tuple(input_features.shape)} "
+                f"sum={float(input_features.sum()):.5f} mean={float(input_features.mean()):.5f} "
+                f"std={float(input_features.std()):.5f} "
+                f"first5={input_features.flatten()[:5].tolist()} "
+                f"mask_sum={int(attention_mask.sum())}",
+                flush=True,
+            )
 
         return {
             "input_audio_features": input_features,

@@ -8,6 +8,7 @@
 # --------------------------------------------------------
 
 import math
+import os
 import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -985,6 +986,26 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 "Number of audio tokens in text does not match the number "
                 f"of audios (tokens={token_count}, audios={len(audios)})."
             )
+        _audio_debug = os.environ.get("VLLM_AUDIO_DEBUG", "0") not in ("0", "", "false", "False")
+        if _audio_debug:
+            print(
+                f"[AUDIO_DEBUG _preprocess_audio] num_audios={len(audios)} "
+                f"audio_context_token_count_pre={token_count} "
+                f"prompt_preview={text[0][:300]!r}",
+                flush=True,
+            )
+            for i, a in enumerate(audios):
+                a_arr = np.asarray(a)
+                n_tokens = extractor.audio_token_count(len(a_arr))
+                print(
+                    f"[AUDIO_DEBUG _preprocess_audio] audio[{i}] "
+                    f"shape={a_arr.shape} dtype={a_arr.dtype} "
+                    f"len_samples={len(a_arr)} "
+                    f"min={float(a_arr.min()):.5f} max={float(a_arr.max()):.5f} "
+                    f"mean={float(a_arr.mean()):.5f} abs_mean={float(np.abs(a_arr).mean()):.5f} "
+                    f"audio_token_count={n_tokens}",
+                    flush=True,
+                )
         audio_index = 0
         for idx, part in enumerate(parts):
             if part == AUDIO_CONTEXT:
@@ -993,6 +1014,26 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
                 audio_index += 1
         text = ["".join(parts)]
         audio_inputs = extractor(audios)
+        if _audio_debug:
+            feat = audio_inputs["input_audio_features"]
+            mask = audio_inputs["feature_attention_mask"]
+            print(
+                f"[AUDIO_DEBUG _preprocess_audio] input_audio_features "
+                f"shape={tuple(feat.shape)} dtype={feat.dtype} "
+                f"sum={float(feat.sum()):.5f} mean={float(feat.mean()):.5f} "
+                f"first5={feat.flatten()[:5].tolist()}",
+                flush=True,
+            )
+            print(
+                f"[AUDIO_DEBUG _preprocess_audio] feature_attention_mask "
+                f"shape={tuple(mask.shape)} sum={int(mask.sum())} "
+                f"audio_num_clips={audio_inputs['audio_num_clips']}",
+                flush=True,
+            )
+            print(
+                f"[AUDIO_DEBUG _preprocess_audio] rendered_prompt_head={text[0][:400]!r}",
+                flush=True,
+            )
         return text, audio_inputs
 
     def __call__(
@@ -1017,6 +1058,19 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         videos = self._make_batch_input(videos)
         audios = self._make_batch_input(audios)
 
+        _prompt_debug = os.environ.get("VLLM_PROMPT_DEBUG", "0") not in ("0", "", "false", "False")
+        if _prompt_debug:
+            # NOTE: `text` here is the per-MM-item placeholder text (e.g.
+            # "<video>"), NOT the full post-chat-template prompt. For the full
+            # rendered prompt, see [PROMPT_DEBUG apply] logs.
+            print(
+                f"[PROMPT_DEBUG NanoNemotronVLProcessor.__call__] "
+                f"per-item input text (pre-MM-replacement), "
+                f"n_images={len(images)} n_videos={len(videos)} n_audios={len(audios)}:\n"
+                f"{text[0]!r}",
+                flush=True,
+            )
+
         text, image_inputs = self._preprocess_image(
             text=text,
             images=images,
@@ -1032,6 +1086,19 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
             text=text,
             audios=audios,
         )
+
+        if _prompt_debug:
+            print(
+                f"[PROMPT_DEBUG NanoNemotronVLProcessor.__call__] "
+                f"POST-MM-REPLACEMENT text (pre-tokenize, first 2000 chars):\n"
+                f"{text[0][:2000]!r}",
+                flush=True,
+            )
+            print(
+                f"[PROMPT_DEBUG NanoNemotronVLProcessor.__call__] "
+                f"POST-MM-REPLACEMENT text length={len(text[0])} chars",
+                flush=True,
+            )
 
         text_inputs = self.tokenizer(text, add_special_tokens=False)
 
