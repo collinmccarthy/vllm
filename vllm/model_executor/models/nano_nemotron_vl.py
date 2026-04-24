@@ -10,6 +10,7 @@
 import math
 import warnings
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import cached_property
 from io import BytesIO
 from typing import Annotated, Literal, TypeAlias
@@ -195,6 +196,102 @@ class NanoNemotronVLVideoEmbeddingInputs(TensorSchema):
 NanoNemotronVLVideoInputs: TypeAlias = (
     NanoNemotronVLVideoPixelInputs | NanoNemotronVLVideoEmbeddingInputs
 )
+
+
+@dataclass(frozen=True)
+class _VideoSegment:
+    """A contiguous run of frames from one video placed inside a microbatch.
+
+    ``frame_start`` is video-relative (i.e. an offset into the video's own
+    frame range, not into the concatenated ``pixel_values`` tensor).
+    """
+
+    video_idx: int
+    frame_start: int
+    num_frames: int
+
+
+def _pack_video_segments_into_microbatches(
+    num_frames_per_video: list[int],
+    micro_batch_size: int,
+    T: int,
+) -> list[list[_VideoSegment]]:
+    """Pack videos into microbatches of <= ``micro_batch_size`` billed frames.
+
+    Billing: each segment is billed as ``ceil(num_frames / T) * T`` —
+    the padded frame-equivalent actually processed after tubelet grouping.
+
+    Invariant (asserted): every non-final segment of a video has
+    ``num_frames % T == 0``, so ``forward_video`` never repeat-pads a
+    non-final segment and tubelet membership is preserved across segment
+    boundaries. Only the final segment of a video may have a
+    non-multiple of ``T``, and it is padded by repeating its last frame —
+    matching solo-video behavior.
+
+    A video that fits whole is never split: it joins the current microbatch
+    if it fits, otherwise starts a new one. Output order is video-major;
+    videos with ``nf <= 0`` are skipped.
+    """
+    assert T > 0, "T must be positive"
+    assert micro_batch_size > 0, "micro_batch_size must be positive"
+    assert micro_batch_size % T == 0, (
+        "micro_batch_size must be a multiple of T so non-final segments fit"
+    )
+
+    def _bill(nf: int) -> int:
+        return math.ceil(nf / T) * T
+
+    microbatches: list[list[_VideoSegment]] = []
+    cur_microbatch: list[_VideoSegment] = []
+    cur_billed = 0
+
+    def _flush() -> None:
+        nonlocal cur_microbatch, cur_billed
+        if cur_microbatch:
+            microbatches.append(cur_microbatch)
+            cur_microbatch = []
+            cur_billed = 0
+
+    for video_idx, nf in enumerate(num_frames_per_video):
+        if nf <= 0:
+            continue
+
+        full_billed = _bill(nf)
+
+        if full_billed <= micro_batch_size:
+            # Fits whole in a single microbatch: never split.
+            if cur_billed + full_billed > micro_batch_size:
+                _flush()
+            cur_microbatch.append(_VideoSegment(video_idx, 0, nf))
+            cur_billed += full_billed
+            continue
+
+        # Too large for any single microbatch: chunk greedily, filling the
+        # current microbatch with a non-final segment before emitting full
+        # microbatch chunks.
+        frame_start = 0
+        remaining = nf
+        while remaining > 0:
+            cap = micro_batch_size - cur_billed
+
+            if _bill(remaining) <= cap:
+                cur_microbatch.append(_VideoSegment(video_idx, frame_start, remaining))
+                cur_billed += _bill(remaining)
+                frame_start += remaining
+                remaining = 0
+            else:
+                chunk = (cap // T) * T
+                if chunk == 0:
+                    _flush()
+                    continue
+                assert chunk % T == 0, "non-final segment must be a multiple of T"
+                cur_microbatch.append(_VideoSegment(video_idx, frame_start, chunk))
+                cur_billed += chunk
+                frame_start += chunk
+                remaining -= chunk
+
+    _flush()
+    return microbatches
 
 
 class NanoNemotronVLProcessingInfo(BaseProcessingInfo):
@@ -902,6 +999,11 @@ class NanoNemotronVLDummyInputsBuilder(
 class NemotronH_Nano_VL_V2(
     nn.Module, HasInnerState, IsHybrid, SupportsMultiModal, SupportsMultiModalPruning
 ):
+    # Signals that this model can safely bypass the runner's sequential
+    # video fallback and bound its own video encoder memory use.
+    handles_video_batching_internally: bool = True
+    video_encoder_micro_batch_size: int = 128
+
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
             "language_model.backbone": "language_model.model",
@@ -938,6 +1040,13 @@ class NemotronH_Nano_VL_V2(
         vision_config = getattr(config, "vision_config", config)
         self.video_temporal_patch_size: int = getattr(
             vision_config, "video_temporal_patch_size", 1
+        )
+        self.video_encoder_micro_batch_size = int(
+            getattr(
+                config,
+                "video_encoder_micro_batch_size",
+                self.video_encoder_micro_batch_size,
+            )
         )
 
         with self._mark_language_model(vllm_config):
@@ -1060,7 +1169,8 @@ class NemotronH_Nano_VL_V2(
     def extract_feature(
         self,
         pixel_values: torch.Tensor,
-        num_frames: int | None = None,
+        *,
+        num_frames: list[int] | None = None,
     ) -> torch.Tensor:
         # Process images in a micro-batch of at most 128 frames per call
         #   This is done on purpose to ensure peak GPU ram usage of huge batch
@@ -1072,7 +1182,7 @@ class NemotronH_Nano_VL_V2(
         N, _C, H, W = pixel_values.shape
 
         T = self.video_temporal_patch_size if num_frames is not None else 1
-        micro_batch_size = 128 - (128 % T)
+        micro_batch_size = self._get_video_encoder_micro_batch_size(T)
         patch_size = self.patch_size
         H_patches = H // patch_size
         W_patches = W // patch_size
@@ -1081,7 +1191,7 @@ class NemotronH_Nano_VL_V2(
         for i in range(0, N, micro_batch_size):
             chunk = pixel_values[i : i + micro_batch_size]
             if num_frames is not None and T > 1:
-                _, vit_embeds = self.vision_model(chunk, num_frames=chunk.shape[0])
+                _, vit_embeds = self.vision_model(chunk, num_frames=[chunk.shape[0]])
             else:
                 _, vit_embeds = self.vision_model(chunk)
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
@@ -1166,6 +1276,7 @@ class NemotronH_Nano_VL_V2(
         """Process video input and create final embeddings with video content
         and indicator tokens."""
         T = self.video_temporal_patch_size
+
         if T > 1:
             video_embeddings = self._extract_video_embeddings_temporal(video_input)
         else:
@@ -1226,6 +1337,23 @@ class NemotronH_Nano_VL_V2(
 
         return final_video_embeddings
 
+    @staticmethod
+    def _has_varying_resolution(pixel_values: list[torch.Tensor]) -> bool:
+        return len({(pv.shape[-2], pv.shape[-1]) for pv in pixel_values}) > 1
+
+    def _get_video_encoder_micro_batch_size(self, T: int) -> int:
+        return self.video_encoder_micro_batch_size - (
+            self.video_encoder_micro_batch_size % T
+        )
+
+    def _get_video_encoder_max_patches_per_microbatch(
+        self, patch_size: int, T: int
+    ) -> int:
+        micro_batch_size = self._get_video_encoder_micro_batch_size(T)
+        image_size = int(self.config.force_image_size)
+        patches_per_frame = (image_size // patch_size) ** 2
+        return micro_batch_size * patches_per_frame
+
     def _extract_video_embeddings_temporal(
         self, video_input: NanoNemotronVLVideoPixelInputs
     ) -> tuple[torch.Tensor, ...]:
@@ -1233,7 +1361,7 @@ class NemotronH_Nano_VL_V2(
 
         Two paths:
         * **Same-resolution** (all videos share H, W): raw-pixel fast
-          path with micro-batch windows of ~128 frames.
+          path with encoder microbatches.
         * **Varying-resolution** (different H, W across videos):
           pre-patch to dynamic format and use the dynamic-resolution
           ViT path with per-tubelet positional encoding.
@@ -1241,80 +1369,77 @@ class NemotronH_Nano_VL_V2(
         pixel_values = video_input["pixel_values_flat"]
         num_frames_per_video = video_input["num_patches"].tolist()
         hidden_size = self.config.text_config.hidden_size
-        is_list = not torch.is_tensor(pixel_values)
 
         T = self.video_temporal_patch_size
         patch_size = self.patch_size
 
-        varying_res = (
-            is_list
-            and len(pixel_values) > 1
-            and len({(pv.shape[-2], pv.shape[-1]) for pv in pixel_values}) > 1
-        )
-
-        if varying_res:
+        if not torch.is_tensor(pixel_values) and self._has_varying_resolution(
+            pixel_values
+        ):
             return self._extract_video_embeddings_temporal_dynamic(
-                pixel_values,
-                num_frames_per_video,
-                hidden_size,
-                T,
-                patch_size,
+                pixel_values=pixel_values,
+                num_frames_per_video=num_frames_per_video,
+                hidden_size=hidden_size,
+                T=T,
+                patch_size=patch_size,
             )
 
-        return self._extract_video_embeddings_temporal_fast(
-            pixel_values,
-            num_frames_per_video,
-            hidden_size,
-            is_list,
-            T,
-            patch_size,
+        all_frames = (
+            pixel_values
+            if torch.is_tensor(pixel_values)
+            else torch.cat(pixel_values, dim=0)
+        )
+        return self._extract_video_embeddings_temporal_same_resolution(
+            pixel_values=all_frames,
+            num_frames_per_video=num_frames_per_video,
+            hidden_size=hidden_size,
+            T=T,
+            patch_size=patch_size,
         )
 
-    def _extract_video_embeddings_temporal_fast(
+    def _extract_video_embeddings_temporal_same_resolution(
         self,
-        pixel_values,
+        *,
+        pixel_values: torch.Tensor,
         num_frames_per_video: list[int],
         hidden_size: int,
-        is_list: bool,
         T: int,
         patch_size: int,
     ) -> tuple[torch.Tensor, ...]:
-        """Same-resolution fast path with micro-batch windows."""
-        micro_batch_size = 128 - (128 % T)
+        """Same-resolution path with cross-video encoder microbatches.
 
-        all_frames = torch.cat(pixel_values, dim=0) if is_list else pixel_values
-        _N, _C, H, W = all_frames.shape
+        Videos are split into tubelet-aligned segments and greedily packed
+        into microbatches by ``_pack_video_segments_into_microbatches`` so
+        no microbatch exceeds the billed frame budget, while small videos
+        still share a single ``vision_model`` forward call.
+        """
+        micro_batch_size = self._get_video_encoder_micro_batch_size(T)
+        microbatches = _pack_video_segments_into_microbatches(
+            num_frames_per_video, micro_batch_size, T
+        )
+
+        _N, _C, H, W = pixel_values.shape
         H_patches = H // patch_size
         W_patches = W // patch_size
 
-        windows: list[list[tuple[int, int]]] = []
-        cur_segs: list[tuple[int, int]] = []
-        cur_size = 0
-        global_offset = 0
-
+        # Absolute frame offsets into pixel_values.
+        video_frame_offsets = [0]
         for nf in num_frames_per_video:
-            if cur_segs and cur_size + nf > micro_batch_size:
-                windows.append(cur_segs)
-                cur_segs = []
-                cur_size = 0
-            cur_segs.append((global_offset, nf))
-            cur_size += nf
-            global_offset += nf
+            video_frame_offsets.append(video_frame_offsets[-1] + nf)
 
-        if cur_segs:
-            windows.append(cur_segs)
+        video_parts: list[list[torch.Tensor]] = [[] for _ in num_frames_per_video]
 
-        results: list[torch.Tensor] = []
-        for window in windows:
+        for microbatch in microbatches:
             frame_chunks = []
-            window_num_frames = []
-            for frame_start, nf in window:
-                frame_chunks.append(all_frames[frame_start : frame_start + nf])
-                window_num_frames.append(nf)
+            microbatch_num_frames = []
+            for seg in microbatch:
+                base = video_frame_offsets[seg.video_idx] + seg.frame_start
+                frame_chunks.append(pixel_values[base : base + seg.num_frames])
+                microbatch_num_frames.append(seg.num_frames)
 
-            window_frames = torch.cat(frame_chunks, dim=0)
+            microbatch_frames = torch.cat(frame_chunks, dim=0)
             _, vit_embeds = self.vision_model(
-                window_frames, num_frames=window_num_frames
+                microbatch_frames, num_frames=microbatch_num_frames
             )
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
             vit_embeds = vit_embeds.reshape(
@@ -1329,16 +1454,20 @@ class NemotronH_Nano_VL_V2(
             vit_embeds = self.mlp1(vit_embeds)
 
             tubelet_offset = 0
-            for _, nf in window:
-                nt = math.ceil(nf / T)
-                vid_embeds = vit_embeds[tubelet_offset : tubelet_offset + nt]
-                results.append(vid_embeds.reshape(-1, hidden_size))
+            for seg in microbatch:
+                nt = math.ceil(seg.num_frames / T)
+                video_parts[seg.video_idx].append(
+                    vit_embeds[tubelet_offset : tubelet_offset + nt]
+                )
                 tubelet_offset += nt
 
-        return tuple(results)
+        return tuple(
+            torch.cat(parts, dim=0).reshape(-1, hidden_size) for parts in video_parts
+        )
 
     def _extract_video_embeddings_temporal_dynamic(
         self,
+        *,
         pixel_values: list[torch.Tensor],
         num_frames_per_video: list[int],
         hidden_size: int,
@@ -1348,11 +1477,12 @@ class NemotronH_Nano_VL_V2(
         """Varying-resolution path: pre-patch frames to dynamic
         format and process with per-tubelet positional encoding.
 
-        Videos are grouped into micro-batch windows by total patch count
-        to cap peak memory, mirroring the fast path's frame-based windowing.
+        Videos are grouped into encoder microbatches by total patch count
+        to cap peak memory, mirroring the same-resolution frame budget.
         """
-        # 128 frames at base 256 patches/frame (224×224, P=14).
-        max_patches_per_window = 32768
+        max_patches_per_microbatch = self._get_video_encoder_max_patches_per_microbatch(
+            patch_size, T
+        )
 
         # Pre-patch all videos up front:
         # [nf_i, 3, H_i, W_i] → [nf_i*(H_i/P)*(W_i/P), 3*P*P]
@@ -1372,47 +1502,47 @@ class NemotronH_Nano_VL_V2(
             per_video_patches.append(patches)
             per_video_imgs_sizes.append([(H_i, W_i)] * nf)
 
-        # Greedy bin-pack videos into windows by total patch count.
-        windows: list[list[int]] = []
-        cur_window: list[int] = []
+        # Greedy bin-pack videos into microbatches by total patch count.
+        microbatches: list[list[int]] = []
+        cur_microbatch: list[int] = []
         cur_patches = 0
 
         for i, patches in enumerate(per_video_patches):
             n_patches = patches.shape[0]
-            if cur_window and cur_patches + n_patches > max_patches_per_window:
-                windows.append(cur_window)
-                cur_window = []
+            if cur_microbatch and cur_patches + n_patches > max_patches_per_microbatch:
+                microbatches.append(cur_microbatch)
+                cur_microbatch = []
                 cur_patches = 0
-            cur_window.append(i)
+            cur_microbatch.append(i)
             cur_patches += n_patches
 
-        if cur_window:
-            windows.append(cur_window)
+        if cur_microbatch:
+            microbatches.append(cur_microbatch)
 
         ds = self.downsample_ratio
         results: list[torch.Tensor] = []
 
-        for window in windows:
-            window_patch_chunks = [per_video_patches[i] for i in window]
-            window_imgs_sizes: list[tuple[int, int]] = []
-            window_num_frames: list[int] = []
-            for i in window:
-                window_imgs_sizes.extend(per_video_imgs_sizes[i])
-                window_num_frames.append(num_frames_per_video[i])
+        for microbatch in microbatches:
+            microbatch_patch_chunks = [per_video_patches[i] for i in microbatch]
+            microbatch_imgs_sizes: list[tuple[int, int]] = []
+            microbatch_num_frames: list[int] = []
+            for i in microbatch:
+                microbatch_imgs_sizes.extend(per_video_imgs_sizes[i])
+                microbatch_num_frames.append(num_frames_per_video[i])
 
-            window_patches = torch.cat(window_patch_chunks, dim=0).unsqueeze(
+            microbatch_patches = torch.cat(microbatch_patch_chunks, dim=0).unsqueeze(
                 0
-            )  # [1, window_total_patches, 3*P*P]
+            )  # [1, microbatch_total_patches, 3*P*P]
 
             _, vit_embeds = self.vision_model(
-                window_patches,
-                imgs_sizes=window_imgs_sizes,
-                num_frames=window_num_frames,
+                microbatch_patches,
+                imgs_sizes=microbatch_imgs_sizes,
+                num_frames=microbatch_num_frames,
             )
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
 
             tubelet_imgs_sizes: list[tuple[int, int]] = []
-            for i in window:
+            for i in microbatch:
                 nf = num_frames_per_video[i]
                 nt = math.ceil(nf / T)
                 H_i, W_i = pixel_values[i].shape[-2], pixel_values[i].shape[-1]
@@ -1424,7 +1554,7 @@ class NemotronH_Nano_VL_V2(
             vit_embeds = self.mlp1(vit_embeds)
 
             token_offset = 0
-            for i in window:
+            for i in microbatch:
                 nf = num_frames_per_video[i]
                 nt = math.ceil(nf / T)
                 H_i, W_i = pixel_values[i].shape[-2], pixel_values[i].shape[-1]
@@ -1564,17 +1694,15 @@ class NemotronH_Nano_VL_V2(
                 and pixel_values_flat_video.ndim == 5
             ):
                 # batched._reduce_data stacked same-shape videos into
-                # [num_videos, nf, 3, H, W]; unstack back to a list so the
-                # same-H,W cat path below handles it uniformly.
-                pixel_values_flat_video = list(pixel_values_flat_video)
+                # [num_videos, nf, 3, H, W]; flatten to
+                # [total_frames, 3, H, W].
+                n, nf = pixel_values_flat_video.shape[:2]
+                pixel_values_flat_video = pixel_values_flat_video.reshape(
+                    n * nf, *pixel_values_flat_video.shape[2:]
+                )
 
             if not torch.is_tensor(pixel_values_flat_video):
-                if all(
-                    t.shape[-2:] == pixel_values_flat_video[0].shape[-2:]
-                    for t in pixel_values_flat_video
-                ):
-                    pixel_values_flat_video = torch.cat(pixel_values_flat_video, dim=0)
-                else:
+                if self._has_varying_resolution(pixel_values_flat_video):
                     return NanoNemotronVLVideoPixelInputs(
                         type="pixel_values_videos",
                         pixel_values_flat=pixel_values_flat_video,
@@ -1583,6 +1711,7 @@ class NemotronH_Nano_VL_V2(
                         frame_duration_ms=frame_duration_ms,
                         validate=False,
                     )
+                pixel_values_flat_video = torch.cat(pixel_values_flat_video, dim=0)
 
             expected_h = pixel_values_flat_video.shape[-2]
             expected_w = pixel_values_flat_video.shape[-1]

@@ -770,21 +770,20 @@ class RadioInternVisionModel(nn.Module):
         self,
         x: torch.Tensor,
         imgs_sizes: list[tuple[int, int]] | None = None,
-        num_frames: int | list[int] | None = None,
+        num_frames: list[int] | None = None,
     ) -> torch.FloatTensor:
         T = self.temporal_patch_size
 
         # Reset per-call state used by RadioModel._extract_final
         self._tubelet_imgs_sizes: list[tuple[int, int]] | None = None
 
+        # Build packed-sequence metadata for MMEncoderAttention when needed.
         mask_meta = None
-        packed_batch_size = None
+        packed_batch_size = None  # Original batch size before packing
 
         if num_frames is not None and T > 1 and imgs_sizes is not None:
             # Dynamic-resolution video: variable-size tubelets packed
             # into [1, total_seq, hidden] with per-tubelet attention.
-            if isinstance(num_frames, int):
-                num_frames = [num_frames]
             hidden_states, tubelet_imgs_sizes, _ = (
                 self.patch_generator.forward_video_dynamic(x, imgs_sizes, num_frames)
             )
@@ -796,8 +795,6 @@ class RadioInternVisionModel(nn.Module):
         elif num_frames is not None and T > 1:
             # Same-resolution video (fast path): uniform tubelets
             # packed into [1, total, hidden].
-            if isinstance(num_frames, int):
-                num_frames = [num_frames]
             hidden_states, _ntp = self.patch_generator.forward_video(x, num_frames)
             packed_batch_size, seq_per_tubelet, hidden_dim = hidden_states.shape
             hidden_states = hidden_states.reshape(1, -1, hidden_dim)
@@ -807,15 +804,17 @@ class RadioInternVisionModel(nn.Module):
             )
 
         else:
-            # Images (fixed or dynamic resolution)
+            # Images for any model, or video for non-conv3d model
             hidden_states = self.patch_generator(x, imgs_sizes=imgs_sizes)
             if imgs_sizes is not None and len(imgs_sizes) > 1:
+                # Dynamic resolution w/ > 1 image, create attn mask
                 mask_meta = self.inter_image_mask_metadata(
                     imgs_sizes, device=hidden_states.device
                 )
 
         encoder_outputs = self.encoder(inputs_embeds=hidden_states, mask_meta=mask_meta)
 
+        # Unpack back to original batch shape if we packed for video
         if packed_batch_size is not None:
             encoder_outputs = encoder_outputs.reshape(
                 packed_batch_size, seq_per_tubelet, -1
@@ -864,7 +863,7 @@ class RadioModel(nn.Module):
         pixel_embeds: torch.Tensor | None = None,
         *,
         imgs_sizes: list[tuple[int, int]] | None = None,
-        num_frames: int | list[int] | None = None,
+        num_frames: list[int] | None = None,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         y = self.model(
             pixel_values,
