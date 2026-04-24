@@ -216,27 +216,35 @@ def _pack_video_segments_into_microbatches(
     micro_batch_size: int,
     T: int,
 ) -> list[list[_VideoSegment]]:
-    """Pack videos into microbatches of <= ``micro_batch_size`` billed frames.
+    """Pack video frame segments into encoder microbatches.
 
-    Billing: each segment is billed as ``ceil(num_frames / T) * T`` —
-    the padded frame-equivalent actually processed after tubelet grouping.
+    Each returned inner list corresponds to one ``vision_model`` forward
+    call. The billed frame count of each microbatch is capped by
+    ``micro_batch_size``. Non-final segments are tubelet-aligned; final
+    segments may be padded by the vision model in the same way as solo
+    processing.
 
-    Invariant (asserted): every non-final segment of a video has
-    ``num_frames % T == 0``, so ``forward_video`` never repeat-pads a
-    non-final segment and tubelet membership is preserved across segment
-    boundaries. Only the final segment of a video may have a
-    non-multiple of ``T``, and it is padded by repeating its last frame —
-    matching solo-video behavior.
+    Invariants:
+    * each segment bills as ``ceil(num_frames / T) * T``
+    * each microbatch stays within ``micro_batch_size``
+    * non-final segments have ``num_frames % T == 0``
+    * final segments may be odd
+    * videos that fit whole are not split
+    * output order is video-major
 
-    A video that fits whole is never split: it joins the current microbatch
-    if it fits, otherwise starts a new one. Output order is video-major;
-    videos with ``nf <= 0`` are skipped.
+    ``num_frames_per_video`` must contain strictly positive frame counts;
+    an empty list is allowed and returns no microbatches.
     """
-    assert T > 0, "T must be positive"
-    assert micro_batch_size > 0, "micro_batch_size must be positive"
-    assert micro_batch_size % T == 0, (
-        "micro_batch_size must be a multiple of T so non-final segments fit"
-    )
+    if T <= 0:
+        raise ValueError("T must be positive")
+    if micro_batch_size <= 0:
+        raise ValueError("micro_batch_size must be positive")
+    if micro_batch_size % T != 0:
+        raise ValueError(
+            "micro_batch_size must be a multiple of T so non-final segments fit"
+        )
+    if any(nf <= 0 for nf in num_frames_per_video):
+        raise ValueError("num_frames_per_video must contain positive frame counts")
 
     def _bill(nf: int) -> int:
         return math.ceil(nf / T) * T
@@ -253,9 +261,6 @@ def _pack_video_segments_into_microbatches(
             cur_billed = 0
 
     for video_idx, nf in enumerate(num_frames_per_video):
-        if nf <= 0:
-            continue
-
         full_billed = _bill(nf)
 
         if full_billed <= micro_batch_size:
@@ -266,9 +271,9 @@ def _pack_video_segments_into_microbatches(
             cur_billed += full_billed
             continue
 
-        # Too large for any single microbatch: chunk greedily, filling the
-        # current microbatch with a non-final segment before emitting full
-        # microbatch chunks.
+        # Too large for any single microbatch: chunk greedily, filling
+        # the current microbatch with a non-final segment before emitting
+        # full microbatch-sized chunks.
         frame_start = 0
         remaining = nf
         while remaining > 0:
@@ -284,7 +289,6 @@ def _pack_video_segments_into_microbatches(
                 if chunk == 0:
                     _flush()
                     continue
-                assert chunk % T == 0, "non-final segment must be a multiple of T"
                 cur_microbatch.append(_VideoSegment(video_idx, frame_start, chunk))
                 cur_billed += chunk
                 frame_start += chunk
@@ -1410,11 +1414,11 @@ class NemotronH_Nano_VL_V2(
 
         Videos are split into tubelet-aligned segments and greedily packed
         into microbatches by ``_pack_video_segments_into_microbatches`` so
-        no microbatch exceeds the billed frame budget, while small videos
-        still share a single ``vision_model`` forward call.
+        no encoder step exceeds the billed frame budget, while small
+        videos still share a single ``vision_model`` forward call.
         """
         micro_batch_size = self._get_video_encoder_micro_batch_size(T)
-        microbatches = _pack_video_segments_into_microbatches(
+        segment_microbatches = _pack_video_segments_into_microbatches(
             num_frames_per_video, micro_batch_size, T
         )
 
@@ -1429,9 +1433,9 @@ class NemotronH_Nano_VL_V2(
 
         video_parts: list[list[torch.Tensor]] = [[] for _ in num_frames_per_video]
 
-        for microbatch in microbatches:
+        for microbatch in segment_microbatches:
             frame_chunks = []
-            microbatch_num_frames = []
+            microbatch_num_frames: list[int] = []
             for seg in microbatch:
                 base = video_frame_offsets[seg.video_idx] + seg.frame_start
                 frame_chunks.append(pixel_values[base : base + seg.num_frames])
@@ -1477,8 +1481,11 @@ class NemotronH_Nano_VL_V2(
         """Varying-resolution path: pre-patch frames to dynamic
         format and process with per-tubelet positional encoding.
 
-        Videos are grouped into encoder microbatches by total patch count
-        to cap peak memory, mirroring the same-resolution frame budget.
+        Whole videos are greedily grouped into encoder microbatches by
+        total patch count, targeting the same peak-memory envelope as
+        the same-resolution frame budget. A single video whose patch
+        count exceeds the budget is not split: it forms a microbatch of
+        its own and is sent through the encoder in one forward call.
         """
         max_patches_per_microbatch = self._get_video_encoder_max_patches_per_microbatch(
             patch_size, T
