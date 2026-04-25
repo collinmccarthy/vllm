@@ -84,8 +84,6 @@ def test_load_weights_keeps_flag_false_when_no_video_embedder_weight():
     # ViTPatchLinear(patch_size=14, embed_dim=32) without temporal
     # dimension: out=32, in=3*14*14.
     weight = torch.zeros(32, 3 * 14 * 14)
-    radio.load_weights(
-        [("radio_model.model.patch_generator.embedder.weight", weight)]
-    )
+    radio.load_weights([("radio_model.model.patch_generator.embedder.weight", weight)])
 
     assert pg._video_embedder_loaded is False
