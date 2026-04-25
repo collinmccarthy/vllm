@@ -2754,6 +2754,20 @@ class GPUModelRunner(
         # encoder outputs.
         model = cast(SupportsMultiModal, self.model)
 
+        # Sort by modality so that group_and_batch_mm_kwargs sees consecutive
+        # same-modality items and can batch them across requests.
+        # Example: [video_req1, audio_req1, video_req2, audio_req2]
+        #       -> [audio_req1, audio_req2, video_req1, video_req2]
+        # mm_hashes and mm_lora_refs are kept in sync so that:
+        # - the cache-by-hash logic below (zip(mm_hashes, encoder_outputs))
+        #   remains correct, and
+        # - the LoRA mapping block below iterates mm_lora_refs in the same
+        #   order that group_and_batch_mm_kwargs will dispatch to the encoder.
+        _perm = sorted(range(len(mm_kwargs)), key=lambda i: mm_kwargs[i][0])
+        mm_kwargs = [mm_kwargs[i] for i in _perm]
+        mm_hashes = [mm_hashes[i] for i in _perm]
+        mm_lora_refs = [mm_lora_refs[i] for i in _perm]
+
         if self.lora_config and self.lora_manager.supports_tower_connector_lora():
             # Build LoRA mappings independently for encoder inputs
             # (encoder batch structure is different from main batch)
@@ -2822,18 +2836,6 @@ class GPUModelRunner(
                     lora_requests,
                     connector_mapping,
                 )
-
-        # Sort by modality so that group_and_batch_mm_kwargs sees consecutive
-        # same-modality items and can batch them across requests.
-        # Example: [video_req1, audio_req1, video_req2, audio_req2]
-        #       -> [audio_req1, audio_req2, video_req1, video_req2]
-        # This resolves the FIXME above; mm_hashes is kept in sync so that
-        # the cache-by-hash logic below (zip(mm_hashes, encoder_outputs))
-        # remains correct.
-        _perm = sorted(range(len(mm_kwargs)), key=lambda i: mm_kwargs[i][0])
-        mm_kwargs = [mm_kwargs[i] for i in _perm]
-        mm_hashes = [mm_hashes[i] for i in _perm]
-        mm_lora_refs = [mm_lora_refs[i] for i in _perm]
 
         encoder_outputs: list[torch.Tensor] = []
         # Track the current index in mm_kwargs/mm_lora_refs to map groups to request IDs
@@ -5221,26 +5223,62 @@ class GPUModelRunner(
         """Dummy data for profiling and precompiling multimodal models."""
         assert self.mm_budget is not None
 
-        # Don't use `max_items_per_batch` here to avoid redundant computation
+        # Models can opt into heterogeneous profiling dummies (e.g.
+        # mixed aspect-ratio videos that exercise the varying-resolution
+        # reducer path of MultiModalBatchedField). The default is the
+        # cheap "ask for 1 and repeat N times" path.
+        counts_hook = getattr(
+            self.model, "get_dummy_mm_counts_for_profiling", None
+        )
+        distinct_count = (
+            counts_hook(modality, max_items_per_batch) if counts_hook else 1
+        )
+        distinct_count = max(1, min(int(distinct_count), max_items_per_batch))
+
         dummy_mm_inputs = self.mm_registry.get_dummy_mm_inputs(
             self.model_config,
-            mm_counts={modality: 1},
+            mm_counts={modality: distinct_count},
             cache=self.mm_budget.cache,
         )
-        dummy_mm_item = dummy_mm_inputs["mm_kwargs"][modality][0]
+        dummy_items = dummy_mm_inputs["mm_kwargs"][modality]
 
+        # Fail-fast at the source if the registry / hook contract is
+        # violated, instead of with an IndexError deep inside cycling.
+        assert len(dummy_items) >= distinct_count, (
+            f"Expected at least {distinct_count} dummy items for "
+            f"modality={modality!r}, got {len(dummy_items)}"
+        )
         # We use the cache so that the item is saved to the cache,
         # but not read from the cache
-        assert dummy_mm_item is not None, "Item should not already be cached"
+        assert all(item is not None for item in dummy_items), (
+            "Items should not already be cached"
+        )
 
-        return next(
-            mm_kwargs_batch
-            for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
-                [(modality, dummy_mm_item)] * max_items_per_batch,
+        expanded = [
+            dummy_items[i % distinct_count] for i in range(max_items_per_batch)
+        ]
+
+        # All expanded items share the same modality and no
+        # MultiModalSharedField distinctions (profiling dummies), so
+        # group_and_batch_mm_kwargs should yield exactly one group of
+        # size max_items_per_batch. Make that an explicit contract so a
+        # future regression fails here instead of silently dropping
+        # items after the first group.
+        groups = list(
+            group_and_batch_mm_kwargs(
+                [(modality, item) for item in expanded],
                 device=self.device,
                 pin_memory=self.pin_memory,
             )
         )
+        assert len(groups) == 1, (
+            f"Expected profiling dummies to batch into 1 group, got {len(groups)}"
+        )
+        _, num_items, mm_kwargs_batch = groups[0]
+        assert num_items == max_items_per_batch, (
+            f"Expected {max_items_per_batch} items in profiling batch, got {num_items}"
+        )
+        return mm_kwargs_batch
 
     @torch.inference_mode()
     def _dummy_run(

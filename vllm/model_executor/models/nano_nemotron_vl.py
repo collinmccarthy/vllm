@@ -175,7 +175,11 @@ class NanoNemotronVLVideoPixelInputs(TensorSchema):
     """
 
     type: Literal["pixel_values_videos"]
-    pixel_values_flat: Annotated[torch.Tensor, TensorShape("bvf", 3, "h", "w")]
+    # list[Tensor] form is the mixed-resolution batch path; bare Tensor is
+    # the uniform-resolution path after reshape from the batched reducer.
+    pixel_values_flat: Annotated[
+        torch.Tensor | list[torch.Tensor], TensorShape("bvf", 3, "h", "w")
+    ]
     num_patches: Annotated[torch.Tensor, TensorShape("bn")]
     frames_indices: Annotated[torch.Tensor, TensorShape("bvf")]
     frame_duration_ms: Annotated[torch.Tensor, TensorShape("bn")]
@@ -494,12 +498,13 @@ class NanoNemotronVLMultiModalProcessor(
         )
 
     def _get_video_fields_config(self, hf_inputs: BatchFeature):
-        video_num_patches = hf_inputs.get("video_num_patches", torch.empty(0))
-
         return dict(
-            pixel_values_flat_video=MultiModalFieldConfig.flat_from_sizes(
-                "video", video_num_patches
-            ),
+            # Per-video tensors: batched so that MultiModalBatchedField's
+            # reducer stacks same-shape videos into a 5D tensor and
+            # preserves list[Tensor] for mixed-resolution batches across
+            # requests (flat_from_sizes would pad the latter into a single
+            # tensor, hiding the varying-resolution path from the model).
+            pixel_values_flat_video=MultiModalFieldConfig.batched("video"),
             video_num_patches=MultiModalFieldConfig.batched("video"),
             frames_indices=MultiModalFieldConfig.batched("video"),
             frame_duration_ms=MultiModalFieldConfig.batched("video"),
@@ -961,15 +966,45 @@ class NanoNemotronVLDummyInputsBuilder(
                 target_num_frames = num_frames
             num_videos = mm_counts.get("video", 0)
             video_overrides = mm_options.get("video")
-            dummy_video = {
-                "video": self._get_dummy_videos(
-                    width=video_width,
-                    height=video_height,
-                    num_frames=target_num_frames,
-                    num_videos=num_videos,
-                    overrides=video_overrides,
-                )
-            }
+            # Under aspect-preserving sizing with more than one video,
+            # feed the processor non-square input shapes that alternate
+            # 3:2 landscape and 2:3 portrait. The aspect-preserving
+            # resize then produces distinct (target_w, target_h) outputs
+            # under the same patch budget, so memory profiling actually
+            # exercises the list-preserving reducer path of
+            # MultiModalBatchedField. Single-video and non-aspect-
+            # preserving profiling keep the cheap uniform path.
+            heterogeneous_aspect = (
+                num_videos > 1
+                and processor.video_target_num_patches is not None
+                and processor.video_maintain_aspect_ratio
+            )
+            if heterogeneous_aspect:
+                landscape_wh = (image_size * 3 // 2, image_size)
+                portrait_wh = (image_size, image_size * 3 // 2)
+                videos: list = []
+                for i in range(num_videos):
+                    w, h = landscape_wh if i % 2 == 0 else portrait_wh
+                    videos.extend(
+                        self._get_dummy_videos(
+                            width=w,
+                            height=h,
+                            num_frames=target_num_frames,
+                            num_videos=1,
+                            overrides=video_overrides,
+                        )
+                    )
+                dummy_video = {"video": videos}
+            else:
+                dummy_video = {
+                    "video": self._get_dummy_videos(
+                        width=video_width,
+                        height=video_height,
+                        num_frames=target_num_frames,
+                        num_videos=num_videos,
+                        overrides=video_overrides,
+                    )
+                }
         else:
             dummy_video = {}
 
@@ -1023,6 +1058,29 @@ class NemotronH_Nano_VL_V2(
         if modality.startswith("audio"):
             return AUDIO_CONTEXT
         return None
+
+    def get_dummy_mm_counts_for_profiling(
+        self,
+        modality: str,
+        max_items_per_batch: int,
+    ) -> int:
+        """Ask for distinct dummy video items when aspect-preserving sizing
+        can produce mixed H/W across videos. This is what exercises the
+        varying-resolution path of `MultiModalBatchedField._reduce_data`
+        during memory profiling; without it, the profiler only ever sees
+        the uniform-shape stacked tensor path. Non-video modalities and
+        non-aspect-preserving video configs keep the default cheap path.
+        """
+        if modality != "video":
+            return 1
+        vision_config = getattr(self.config, "vision_config", self.config)
+        target_num_patches = getattr(vision_config, "video_target_num_patches", None)
+        maintain_aspect_ratio = getattr(
+            vision_config, "video_maintain_aspect_ratio", False
+        )
+        if target_num_patches is not None and maintain_aspect_ratio:
+            return max_items_per_batch
+        return 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1291,9 +1349,11 @@ class NemotronH_Nano_VL_V2(
         downsample_ratio = self.config.downsample_ratio
         patch_size = self.config.patch_size
         pixel_values = video_input["pixel_values_flat"]
-        frame_h, frame_w = pixel_values.shape[-2], pixel_values.shape[-1]
-        rows = int(frame_h * downsample_ratio // patch_size)
-        cols = int(frame_w * downsample_ratio // patch_size)
+        # Per-video frame H/W: when the dynamic-resolution path is active,
+        # pixel_values is a list of per-video tensors whose spatial dims may
+        # differ; otherwise it's a single [N*F, 3, H, W] tensor with uniform
+        # spatial dims. Always resolve shape per video so both paths work.
+        pixel_values_is_tensor = torch.is_tensor(pixel_values)
         video_pruning_rate = self.video_pruning_rate
         video_num_frames = video_input["num_patches"].tolist()
         video_frames_indices = video_input["frames_indices"].split(video_num_frames)
@@ -1306,6 +1366,11 @@ class NemotronH_Nano_VL_V2(
             frame_duration_ms = video_input["frame_duration_ms"][i].item()
             num_tubelets = math.ceil(num_frames / T) if T > 1 else num_frames
             assert single_video_embeddings.shape[0] % num_tubelets == 0
+
+            frame_tensor = pixel_values if pixel_values_is_tensor else pixel_values[i]
+            frame_h, frame_w = frame_tensor.shape[-2], frame_tensor.shape[-1]
+            rows = int(frame_h * downsample_ratio // patch_size)
+            cols = int(frame_w * downsample_ratio // patch_size)
 
             if video_pruning_rate is not None and video_pruning_rate > 0.0:
                 # Start of EVS-specific code
