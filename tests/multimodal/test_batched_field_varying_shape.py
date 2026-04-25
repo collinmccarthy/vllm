@@ -64,7 +64,7 @@ def test_matching_shape_stacks_to_tensor():
         (MODALITY, _make_item(b)),
     ]
 
-    (_, num_items, batched), = list(
+    ((_, num_items, batched),) = list(
         group_and_batch_mm_kwargs(mm_kwargs, device="cpu")
     )
 
