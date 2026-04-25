@@ -152,12 +152,14 @@ def test_asserts_when_registry_returns_too_few_items():
     )
     _, fake_group = _capture_group_and_batch()
 
-    with pytest.raises(AssertionError, match="Expected at least 3 dummy items"):
-        with patch(
+    with (
+        pytest.raises(AssertionError, match="Expected at least 3 dummy items"),
+        patch(
             "vllm.v1.worker.gpu_model_runner.group_and_batch_mm_kwargs",
             fake_group,
-        ):
-            runner._get_mm_dummy_batch(modality="video", max_items_per_batch=4)
+        ),
+    ):
+        runner._get_mm_dummy_batch(modality="video", max_items_per_batch=4)
 
 
 def test_asserts_when_batching_splits_into_multiple_groups():
