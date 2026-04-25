@@ -5227,9 +5227,7 @@ class GPUModelRunner(
         # mixed aspect-ratio videos that exercise the varying-resolution
         # reducer path of MultiModalBatchedField). The default is the
         # cheap "ask for 1 and repeat N times" path.
-        counts_hook = getattr(
-            self.model, "get_dummy_mm_counts_for_profiling", None
-        )
+        counts_hook = getattr(self.model, "get_dummy_mm_counts_for_profiling", None)
         distinct_count = (
             counts_hook(modality, max_items_per_batch) if counts_hook else 1
         )
@@ -5254,9 +5252,7 @@ class GPUModelRunner(
             "Items should not already be cached"
         )
 
-        expanded = [
-            dummy_items[i % distinct_count] for i in range(max_items_per_batch)
-        ]
+        expanded = [dummy_items[i % distinct_count] for i in range(max_items_per_batch)]
 
         # All expanded items share the same modality and no
         # MultiModalSharedField distinctions (profiling dummies), so

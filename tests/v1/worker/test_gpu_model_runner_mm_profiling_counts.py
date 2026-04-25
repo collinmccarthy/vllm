@@ -49,9 +49,7 @@ def _make_runner(
         modality = next(iter(mm_counts))
         return {"mm_kwargs": {modality: distinct_items[: mm_counts[modality]]}}
 
-    runner.mm_registry = SimpleNamespace(
-        get_dummy_mm_inputs=fake_get_dummy_mm_inputs
-    )
+    runner.mm_registry = SimpleNamespace(get_dummy_mm_inputs=fake_get_dummy_mm_inputs)
 
     model = SimpleNamespace()
     if model_hook is not None:
@@ -179,12 +177,14 @@ def test_asserts_when_batching_splits_into_multiple_groups():
         yield ("video", half, {})
         yield ("video", len(mm_kwargs) - half, {})
 
-    with pytest.raises(AssertionError, match="1 group, got 2"):
-        with patch(
+    with (
+        pytest.raises(AssertionError, match="1 group, got 2"),
+        patch(
             "vllm.v1.worker.gpu_model_runner.group_and_batch_mm_kwargs",
             two_group_fake,
-        ):
-            runner._get_mm_dummy_batch(modality="video", max_items_per_batch=4)
+        ),
+    ):
+        runner._get_mm_dummy_batch(modality="video", max_items_per_batch=4)
 
 
 def test_hook_return_is_clamped():
