@@ -176,6 +176,13 @@ class ViTPatchGenerator(nn.Module):
                 temporal_patch_size=temporal_patch_size,
                 **factory,
             )
+            # Set to True by RadioModel.load_weights when at least one
+            # `model.patch_generator.video_embedder.*` weight loads. The
+            # guard in forward_video_dynamic uses this to surface a clear
+            # error on checkpoints that were not trained with temporal
+            # compression, instead of silently running a random-init
+            # video_embedder.
+            self._video_embedder_loaded = False
 
         if abs_pos:
             scale = embed_dim**-0.5
@@ -919,6 +926,13 @@ class RadioModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
                 loaded_params.add(vllm_key)
+                # Flip the patch generator's load flag once any
+                # video_embedder weight has been loaded. The dynamic-
+                # resolution forward path checks this to refuse running
+                # on temporally-compressed video without trained
+                # weights.
+                if vllm_key.startswith("model.patch_generator.video_embedder."):
+                    self.model.patch_generator._video_embedder_loaded = True
 
         return loaded_params
 
