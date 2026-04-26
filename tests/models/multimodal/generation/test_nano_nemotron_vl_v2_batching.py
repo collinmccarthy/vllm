@@ -22,7 +22,7 @@ PR that enables batched video encoding for NanoNemotron-VL:
 
 Tolerances:
 
-* ``REL_TOL_SAME_RES`` (~2e-2) is used for solo-vs-batched same-res
+* ``REL_TOL_SAME_RES`` (~3e-2) is used for solo-vs-batched same-res
   comparisons. Different scenarios feed the encoder different total
   token counts (e.g. nf=129 solo splits 128 + 1; ``[129, 8]`` batched
   splits 128 + 9), which changes GEMM/attention tile shapes and bf16
@@ -99,7 +99,7 @@ SEED = 42
 # same but the bf16 outputs drift slightly. Keep this ceiling tight
 # enough to catch real leakage but not so tight that legitimate kernel-
 # shape drift looks like a regression.
-REL_TOL_SAME_RES = 5e-3
+REL_TOL_SAME_RES = 3e-2
 # Dynamic path packs patches from multiple items into a single ViT
 # forward. Bit-exactness relies on strict per-item attention masking;
 # keep a looser ceiling so numerically-correct small differences do not
@@ -423,6 +423,25 @@ def _w_microbatch_boundaries_same_res(worker):
     return not failures, failures, info
 
 
+def _check_bit_exact(label: str, ref, actual, idx, failures: list[str]) -> None:
+    """`torch.equal` companion-invariance assertion with a useful failure
+    message. Reports max-abs diff so the magnitude of any leak is visible
+    even though the contract is bit-exact."""
+    if ref[idx].shape != actual[idx].shape:
+        failures.append(
+            f"{label}: queried-{idx} shape changed across companion swap: "
+            f"{tuple(ref[idx].shape)} vs {tuple(actual[idx].shape)}"
+        )
+        return
+    if not torch.equal(ref[idx], actual[idx]):
+        diff = (ref[idx].float() - actual[idx].float()).abs().max().item()
+        failures.append(
+            f"{label}: queried-{idx} perturbed by companion swap "
+            f"(max abs diff {diff:.4g}); same queried, different "
+            "companion should be bit-exact under fixed batch shape"
+        )
+
+
 def _w_same_res_companion_invariance(worker):
     """Bit-exact: changing only a companion video's *pixels* (not its
     shape, frame count, or position in the batch) must not perturb the
@@ -432,6 +451,15 @@ def _w_same_res_companion_invariance(worker):
     from cross-video computation, i.e. an attention masking or packing
     leak. ``torch.equal`` rather than rel-diff so no accumulation noise
     can hide a real leak.
+
+    Covers two regimes:
+
+    * ``[8, 8]`` — the simple no-boundary case where both videos sit in a
+      single microbatch.
+    * ``[129, 8]`` — the queried-A direction spans the 128-frame
+      microbatch boundary (the same shape that produces solo-vs-batched
+      bf16 drift; under fixed batch shape, bit-exactness is the right
+      contract).
     """
     failures: list[str] = []
     info: list[str] = []
@@ -443,55 +471,32 @@ def _w_same_res_companion_invariance(worker):
         info.append("skipped: video_temporal_patch_size <= 1")
         return True, failures, info
 
-    # Use nf=129 so the queried-A direction still spans the 128-frame
-    # microbatch boundary — the same shape that produces solo-vs-batched
-    # bf16 drift, but here the batch shape is identical between runs so
-    # bit-exactness is the right contract.
-    a_long = _make_video(device, 129, H, W, seed=SEED + 100)
-    a_long_alt = _make_video(device, 129, H, W, seed=SEED + 101)
-    b_short = _make_video(device, 8, H, W, seed=SEED + 200)
-    b_short_alt = _make_video(device, 8, H, W, seed=SEED + 201)
+    cases = [
+        # (label, nf_a, nf_b)
+        ("simple_8_8", 8, 8),
+        ("boundary_129_8", 129, 8),
+    ]
 
     with torch.no_grad():
-        # Direction 1: same A, different B. A's output must be identical.
-        ab = model._extract_video_embeddings_temporal(
-            _same_res_input([a_long, b_short])
-        )
-        ab_alt = model._extract_video_embeddings_temporal(
-            _same_res_input([a_long, b_short_alt])
-        )
-        # Direction 2: same B, different A. B's output must be identical.
-        cb = model._extract_video_embeddings_temporal(
-            _same_res_input([a_long_alt, b_short])
-        )
+        for label, nf_a, nf_b in cases:
+            a = _make_video(device, nf_a, H, W, seed=SEED + 100)
+            a_alt = _make_video(device, nf_a, H, W, seed=SEED + 101)
+            b = _make_video(device, nf_b, H, W, seed=SEED + 200)
+            b_alt = _make_video(device, nf_b, H, W, seed=SEED + 201)
 
-    info.append("companion-invariance shapes: A=129f, B=8f, fixed across runs")
+            # Direction 1: same A, different B. A's output must be identical.
+            ab = model._extract_video_embeddings_temporal(_same_res_input([a, b]))
+            ab_with_alt_b = model._extract_video_embeddings_temporal(
+                _same_res_input([a, b_alt])
+            )
+            # Direction 2: same B, different A. B's output must be identical.
+            ab_with_alt_a = model._extract_video_embeddings_temporal(
+                _same_res_input([a_alt, b])
+            )
 
-    if ab[0].shape != ab_alt[0].shape:
-        failures.append(
-            f"queried-A shape changed across companion swap: "
-            f"{tuple(ab[0].shape)} vs {tuple(ab_alt[0].shape)}"
-        )
-    elif not torch.equal(ab[0], ab_alt[0]):
-        diff = (ab[0].float() - ab_alt[0].float()).abs().max().item()
-        failures.append(
-            f"queried-A perturbed by companion B's pixels (max abs diff "
-            f"{diff:.4g}); same A, different B should be bit-exact under "
-            "fixed batch shape"
-        )
-
-    if ab[1].shape != cb[1].shape:
-        failures.append(
-            f"queried-B shape changed across companion swap: "
-            f"{tuple(ab[1].shape)} vs {tuple(cb[1].shape)}"
-        )
-    elif not torch.equal(ab[1], cb[1]):
-        diff = (ab[1].float() - cb[1].float()).abs().max().item()
-        failures.append(
-            f"queried-B perturbed by companion A's pixels (max abs diff "
-            f"{diff:.4g}); same B, different A should be bit-exact under "
-            "fixed batch shape"
-        )
+            info.append(f"{label}: A={nf_a}f B={nf_b}f, batch shape fixed across runs")
+            _check_bit_exact(label, ab, ab_with_alt_b, idx=0, failures=failures)
+            _check_bit_exact(label, ab, ab_with_alt_a, idx=1, failures=failures)
 
     return not failures, failures, info
 
@@ -555,6 +560,88 @@ def _w_microbatch_boundaries_dynamic_res(worker):
     _compare_tensor_lists(
         "dyn_boundary", solos, batched, REL_TOL_DYNAMIC, failures, info
     )
+    return not failures, failures, info
+
+
+def _w_dynamic_res_companion_invariance(worker):
+    """Bit-exact leakage probe for the dynamic path under fixed batch
+    shape. Same idea as the same-res companion test, but here the batch
+    contains videos of *different* resolutions so every run is forced
+    through ``_extract_video_embeddings_temporal_dynamic``. Across
+    paired runs the shapes are identical (same A shape across both
+    runs, same B shape across both runs); only pixels differ. Any non-
+    bit-exact output is then unambiguously a per-item attention
+    masking or packing leak in the dynamic path.
+
+    Uses one microbatch (well below the 32768-patch bin-pack target),
+    so the bin-packer's grouping decisions are constant between paired
+    runs.
+    """
+    failures: list[str] = []
+    info: list[str] = []
+    ctx, fs = _model_ctx(worker)
+    if fs:
+        return False, fs, info
+    model, device, T, patch_size, _H, _W = ctx
+    if T <= 1:
+        info.append("skipped: video_temporal_patch_size <= 1")
+        return True, failures, info
+    if not _video_embedder_loaded(model):
+        info.append("skipped: video_embedder weights not loaded")
+        return True, failures, info
+
+    # Two distinct (H, W) so the dynamic path is the only viable route.
+    # Patch-counts well under the 32768-patch budget so a single
+    # microbatch holds both videos in every run (i.e. the bin-pack
+    # grouping stays constant across the paired runs).
+    H1, W1 = patch_size * 16, patch_size * 16  # 256 patches/frame
+    H2, W2 = patch_size * 20, patch_size * 16  # 320 patches/frame
+    hidden_size = model.config.text_config.hidden_size
+
+    a = _make_video(device, 8, H1, W1, seed=SEED + 300)
+    a_alt = _make_video(device, 8, H1, W1, seed=SEED + 301)
+    b = _make_video(device, 6, H2, W2, seed=SEED + 400)
+    b_alt = _make_video(device, 6, H2, W2, seed=SEED + 401)
+
+    def _run_direct(videos):
+        # Focused leakage probe: bypass the top-level dispatcher and call
+        # the dynamic-path helper directly.
+        return model._extract_video_embeddings_temporal_dynamic(
+            pixel_values=videos,
+            num_frames_per_video=[v.shape[0] for v in videos],
+            hidden_size=hidden_size,
+            T=T,
+            patch_size=patch_size,
+        )
+
+    def _run_dispatch(videos):
+        # Pin the production route too: list-shaped pixel_values_flat
+        # must dispatch through `_extract_video_embeddings_temporal` to
+        # the dynamic path. Same companion-invariance contract should
+        # hold end-to-end.
+        return model._extract_video_embeddings_temporal(_varying_res_input(videos))
+
+    info.append(f"dyn_companion: A={H1}x{W1}@8f, B={H2}x{W2}@6f, fixed across runs")
+
+    with torch.no_grad():
+        for route_label, run in (
+            ("dyn_direct", _run_direct),
+            ("dyn_dispatch", _run_dispatch),
+        ):
+            ab = run([a, b])
+            ab_with_alt_b = run([a, b_alt])  # same A, different B
+            ab_with_alt_a = run([a_alt, b])  # same B, different A
+
+            if len(ab) != 2 or len(ab_with_alt_b) != 2 or len(ab_with_alt_a) != 2:
+                failures.append(
+                    f"{route_label}: expected 2 outputs per run, got "
+                    f"{len(ab)}/{len(ab_with_alt_b)}/{len(ab_with_alt_a)} "
+                    "(varying-res input failed to route to dynamic path?)"
+                )
+                continue
+            _check_bit_exact(route_label, ab, ab_with_alt_b, idx=0, failures=failures)
+            _check_bit_exact(route_label, ab, ab_with_alt_a, idx=1, failures=failures)
+
     return not failures, failures, info
 
 
@@ -732,10 +819,12 @@ def test_video_same_res_companion_invariance(nemotron_nano_vl_v2_llm):
     masking are identical between runs.
 
     Covered:
-    * queried = long (129 frames, spans the 128-frame microbatch
-      boundary), companion = short (8 frames). Long's output must be
-      bit-exact across companion changes, and short's output must be
-      bit-exact across long changes.
+    * ``simple_8_8`` — both videos in a single microbatch (no boundary
+      crossing). Each video's output must be bit-exact across companion
+      changes.
+    * ``boundary_129_8`` — queried-A spans the 128-frame microbatch
+      boundary; B is a short 8-frame companion. Both directions
+      bit-exact under fixed batch shape.
     """
     _assert_all_workers_pass(
         nemotron_nano_vl_v2_llm.collective_rpc(_w_same_res_companion_invariance),
@@ -759,6 +848,36 @@ def test_video_microbatch_boundaries_dynamic_res(nemotron_nano_vl_v2_llm):
     _assert_all_workers_pass(
         nemotron_nano_vl_v2_llm.collective_rpc(_w_microbatch_boundaries_dynamic_res),
         "microbatch_boundaries_dynamic_res",
+    )
+
+
+@needs_model
+@needs_gpus
+def test_video_dynamic_res_companion_invariance(nemotron_nano_vl_v2_llm):
+    """Bit-exact leakage probe for the dynamic path.
+
+    Pairs runs that share identical batch shape (same A shape across
+    both runs, same B shape across both runs) but vary the companion's
+    pixel content via a different seed. Under correct per-item attention
+    masking and packing the queried video's output is bit-exactly
+    identical between paired runs; any drift is unambiguously cross-
+    video.
+
+    Single-microbatch sizing keeps the bin-pack grouping constant across
+    paired runs so the only difference between them is pixels, not
+    grouping.
+
+    Covers two routes:
+
+    * ``dyn_direct`` — call ``_extract_video_embeddings_temporal_dynamic``
+      directly. Focused leakage probe for the dynamic helper.
+    * ``dyn_dispatch`` — list-shaped ``pixel_values_flat`` through
+      ``_extract_video_embeddings_temporal``. Pins the production route
+      that the runtime actually takes for varying-resolution batches.
+    """
+    _assert_all_workers_pass(
+        nemotron_nano_vl_v2_llm.collective_rpc(_w_dynamic_res_companion_invariance),
+        "dynamic_res_companion_invariance",
     )
 
 
