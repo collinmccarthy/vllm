@@ -20,6 +20,21 @@ PR that enables batched video encoding for NanoNemotron-VL:
 * the cache-by-hash loop in `_execute_mm_encoder` that runs after the
   modality-sort permutation.
 
+Tolerances:
+
+* ``REL_TOL_SAME_RES`` (~2e-2) is used for solo-vs-batched same-res
+  comparisons. Different scenarios feed the encoder different total
+  token counts (e.g. nf=129 solo splits 128 + 1; ``[129, 8]`` batched
+  splits 128 + 9), which changes GEMM/attention tile shapes and bf16
+  accumulation order. Small drift is the expected baseline — leakage
+  has to clear that floor to be a regression.
+* ``REL_TOL_DYNAMIC`` (~5e-3) is used for the dynamic path; per-item
+  attention masking should keep numeric noise tighter there.
+* For *true* cross-video leakage the file uses bit-exact
+  (``torch.equal``) companion-invariance tests that hold the batch
+  shape fixed and vary only a companion video's pixels — any non-bit-
+  exact change in the queried video is then unambiguously a leak.
+
 These tests intentionally call private methods such as
 ``_extract_video_embeddings_temporal`` to target the exact paths the PR
 introduces. Expect to update this file whenever those methods are
@@ -76,9 +91,15 @@ needs_gpus = pytest.mark.skipif(
 )
 
 SEED = 42
-# Same-resolution fast path is bit-exact up to bf16 noise (verified in
-# the PR description).
-REL_TOL_EXACT = 1e-3
+# Same-resolution solo-vs-batched comparison: solo and batched runs hand
+# different total token counts to the encoder (e.g. nf=129 solo splits
+# 128 + 1, but `[129-frame, 8-frame]` batched splits 128 + (1 + 8)),
+# which changes varlen metadata, GEMM dimensions, FlashAttention/cuBLAS
+# tile shapes, and bf16 accumulation order. The semantic result is the
+# same but the bf16 outputs drift slightly. Keep this ceiling tight
+# enough to catch real leakage but not so tight that legitimate kernel-
+# shape drift looks like a regression.
+REL_TOL_SAME_RES = 5e-3
 # Dynamic path packs patches from multiple items into a single ViT
 # forward. Bit-exactness relies on strict per-item attention masking;
 # keep a looser ceiling so numerically-correct small differences do not
@@ -234,10 +255,10 @@ def _w_same_res_batched_equals_solo(worker):
         batched2 = model._extract_video_embeddings_temporal(_same_res_input(videos[:2]))
         batched4 = model._extract_video_embeddings_temporal(_same_res_input(videos))
     _compare_tensor_lists(
-        "same_res_bs2", solos[:2], batched2, REL_TOL_EXACT, failures, info
+        "same_res_bs2", solos[:2], batched2, REL_TOL_SAME_RES, failures, info
     )
     _compare_tensor_lists(
-        "same_res_bs4", solos, batched4, REL_TOL_EXACT, failures, info
+        "same_res_bs4", solos, batched4, REL_TOL_SAME_RES, failures, info
     )
     return not failures, failures, info
 
@@ -340,7 +361,7 @@ def _w_packed_tensor_splits(worker):
         )
         packed = model._extract_video_embeddings_temporal(packed_in)
     info.append(f"packed nfs={nfs}")
-    _compare_tensor_lists("packed", solos, packed, REL_TOL_EXACT, failures, info)
+    _compare_tensor_lists("packed", solos, packed, REL_TOL_SAME_RES, failures, info)
     return not failures, failures, info
 
 
@@ -395,10 +416,83 @@ def _w_microbatch_boundaries_same_res(worker):
                 f"boundary_mixed_nf{long_nf}",
                 [solo_long, solo8],
                 both,
-                REL_TOL_EXACT,
+                REL_TOL_SAME_RES,
                 failures,
                 info,
             )
+    return not failures, failures, info
+
+
+def _w_same_res_companion_invariance(worker):
+    """Bit-exact: changing only a companion video's *pixels* (not its
+    shape, frame count, or position in the batch) must not perturb the
+    queried video's output by even one ULP. This holds the encoder
+    execution shape fixed — same total token count, same varlen
+    metadata, same kernel tile shapes — so any drift would have to come
+    from cross-video computation, i.e. an attention masking or packing
+    leak. ``torch.equal`` rather than rel-diff so no accumulation noise
+    can hide a real leak.
+    """
+    failures: list[str] = []
+    info: list[str] = []
+    ctx, fs = _model_ctx(worker)
+    if fs:
+        return False, fs, info
+    model, device, T, _patch_size, H, W = ctx
+    if T <= 1:
+        info.append("skipped: video_temporal_patch_size <= 1")
+        return True, failures, info
+
+    # Use nf=129 so the queried-A direction still spans the 128-frame
+    # microbatch boundary — the same shape that produces solo-vs-batched
+    # bf16 drift, but here the batch shape is identical between runs so
+    # bit-exactness is the right contract.
+    a_long = _make_video(device, 129, H, W, seed=SEED + 100)
+    a_long_alt = _make_video(device, 129, H, W, seed=SEED + 101)
+    b_short = _make_video(device, 8, H, W, seed=SEED + 200)
+    b_short_alt = _make_video(device, 8, H, W, seed=SEED + 201)
+
+    with torch.no_grad():
+        # Direction 1: same A, different B. A's output must be identical.
+        ab = model._extract_video_embeddings_temporal(
+            _same_res_input([a_long, b_short])
+        )
+        ab_alt = model._extract_video_embeddings_temporal(
+            _same_res_input([a_long, b_short_alt])
+        )
+        # Direction 2: same B, different A. B's output must be identical.
+        cb = model._extract_video_embeddings_temporal(
+            _same_res_input([a_long_alt, b_short])
+        )
+
+    info.append("companion-invariance shapes: A=129f, B=8f, fixed across runs")
+
+    if ab[0].shape != ab_alt[0].shape:
+        failures.append(
+            f"queried-A shape changed across companion swap: "
+            f"{tuple(ab[0].shape)} vs {tuple(ab_alt[0].shape)}"
+        )
+    elif not torch.equal(ab[0], ab_alt[0]):
+        diff = (ab[0].float() - ab_alt[0].float()).abs().max().item()
+        failures.append(
+            f"queried-A perturbed by companion B's pixels (max abs diff "
+            f"{diff:.4g}); same A, different B should be bit-exact under "
+            "fixed batch shape"
+        )
+
+    if ab[1].shape != cb[1].shape:
+        failures.append(
+            f"queried-B shape changed across companion swap: "
+            f"{tuple(ab[1].shape)} vs {tuple(cb[1].shape)}"
+        )
+    elif not torch.equal(ab[1], cb[1]):
+        diff = (ab[1].float() - cb[1].float()).abs().max().item()
+        failures.append(
+            f"queried-B perturbed by companion A's pixels (max abs diff "
+            f"{diff:.4g}); same B, different A should be bit-exact under "
+            "fixed batch shape"
+        )
+
     return not failures, failures, info
 
 
@@ -488,7 +582,7 @@ def _w_process_video_input_strict(worker):
         "_process_video_input",
         [solo1[0], solo2[0]],
         batched,
-        REL_TOL_EXACT,
+        REL_TOL_SAME_RES,
         failures,
         info,
     )
@@ -620,6 +714,32 @@ def test_video_microbatch_boundaries_same_res(nemotron_nano_vl_v2_llm):
     _assert_all_workers_pass(
         nemotron_nano_vl_v2_llm.collective_rpc(_w_microbatch_boundaries_same_res),
         "microbatch_boundaries_same_res",
+    )
+
+
+@needs_model
+@needs_gpus
+def test_video_same_res_companion_invariance(nemotron_nano_vl_v2_llm):
+    """Bit-exact leakage probe under fixed execution shape.
+
+    Same-res solo-vs-batched comparisons can drift in bf16 because the
+    encoder packs different total token counts in each scenario. That
+    drift makes solo-vs-batched a poor leakage probe — small numerical
+    differences are *expected* even with perfect masking. This test
+    instead holds the batch shape constant and varies only a companion
+    video's pixel content; any non-bit-exact change in the queried
+    video's output is then provably a cross-video leak, since shape and
+    masking are identical between runs.
+
+    Covered:
+    * queried = long (129 frames, spans the 128-frame microbatch
+      boundary), companion = short (8 frames). Long's output must be
+      bit-exact across companion changes, and short's output must be
+      bit-exact across long changes.
+    """
+    _assert_all_workers_pass(
+        nemotron_nano_vl_v2_llm.collective_rpc(_w_same_res_companion_invariance),
+        "same_res_companion_invariance",
     )
 
 
