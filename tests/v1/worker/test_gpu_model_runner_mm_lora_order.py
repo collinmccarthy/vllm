@@ -23,6 +23,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from vllm.lora.layers.utils import LoRAMapping, LoRAMappingType
+from vllm.lora.request import LoRARequest
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
@@ -51,7 +52,11 @@ def _make_runner(mm_lora_refs, request_lora_mapping, tokens_per_item):
             [request_lora_mapping[rid] for rid in req_ids], dtype=np.int64
         ),
         lora_id_to_lora_request={
-            lora_id: SimpleNamespace(lora_int_id=lora_id)
+            lora_id: LoRARequest(
+                lora_name=f"lora_{lora_id}",
+                lora_int_id=lora_id,
+                lora_path=f"/tmp/lora_{lora_id}",
+            )
             for lora_id in set(request_lora_mapping.values())
             if lora_id > 0
         },
