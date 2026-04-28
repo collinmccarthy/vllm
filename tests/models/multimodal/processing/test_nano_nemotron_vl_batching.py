@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Regression tests for Nano-Nemotron-VL's same-resolution video batching.
+"""Regression tests for Nano-Nemotron-VL video batching.
 
 These tests duck-type a minimal ``NemotronH_Nano_VL_V2`` instance with a
 deterministic tubelet-local ``vision_model`` stub. They verify that
 ``_extract_video_embeddings_temporal_same_resolution`` (segment
 microbatch packing, per-segment slicing, and per-video concatenation)
 produces identical output whether videos are passed packed together or
-one at a time.
+one at a time. The file also pins the processor boundary that must keep
+``pixel_values_flat_video`` as a per-video list through ``BatchFeature``.
 """
 
 import math
@@ -17,6 +18,9 @@ import torch
 import torch.nn as nn
 
 from vllm.model_executor.models.nano_nemotron_vl import NemotronH_Nano_VL_V2
+from vllm.transformers_utils.processors.nano_nemotron_vl import (
+    NanoNemotronVLProcessor,
+)
 
 T = 4
 PATCH_SIZE = 14
@@ -209,3 +213,58 @@ def test_output_count_matches_input_count() -> None:
     nf = [10, 20, 30, 40]
     outputs = _extract(model, _make_pixel_values(nf), nf)
     assert len(outputs) == 4
+
+
+class _StubTokenizer:
+    def __call__(self, text, add_special_tokens=False):
+        return {
+            "input_ids": [[0] for _ in text],
+            "attention_mask": [[1] for _ in text],
+        }
+
+
+def _make_processor(pixel_values_lst_video: list[torch.Tensor]):
+    processor = NanoNemotronVLProcessor.__new__(NanoNemotronVLProcessor)
+    processor.max_num_tiles = 1
+    processor.dynamic_tiler = None
+    processor.tokenizer = _StubTokenizer()
+    processor._preprocess_image = lambda *, text, images, max_num_tiles: (text, {})
+    processor._preprocess_audio = lambda *, text, audios: (text, {})
+
+    def _preprocess_video(*, text, videos):
+        return text, {
+            "pixel_values_flat_video": pixel_values_lst_video,
+            "video_num_patches": torch.tensor(
+                [v.shape[0] for v in pixel_values_lst_video]
+            ),
+            "frames_indices": [list(range(v.shape[0])) for v in pixel_values_lst_video],
+            "frame_duration_ms": torch.full((len(pixel_values_lst_video),), 500),
+        }
+
+    processor._preprocess_video = _preprocess_video
+    return processor
+
+
+@pytest.mark.parametrize(
+    "shapes",
+    [
+        [(2, 3, 24, 36), (2, 3, 36, 24)],
+        [(2, 3, 24, 24), (2, 3, 24, 24)],
+    ],
+)
+def test_processor_keeps_video_values_as_list_through_batch_feature(
+    shapes: list[tuple[int, ...]],
+) -> None:
+    pixel_values_lst_video = [torch.zeros(shape) for shape in shapes]
+    processor = _make_processor(pixel_values_lst_video)
+
+    batch = processor(
+        text="x", videos=[object()] * len(pixel_values_lst_video), return_tensors="pt"
+    )
+
+    out = batch["pixel_values_flat_video"]
+    assert isinstance(out, list)
+    assert len(out) == len(pixel_values_lst_video)
+    assert all(
+        actual is expected for actual, expected in zip(out, pixel_values_lst_video)
+    )

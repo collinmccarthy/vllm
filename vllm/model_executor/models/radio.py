@@ -176,13 +176,6 @@ class ViTPatchGenerator(nn.Module):
                 temporal_patch_size=temporal_patch_size,
                 **factory,
             )
-            # Set to True by RadioModel.load_weights when at least one
-            # `model.patch_generator.video_embedder.*` weight loads. The
-            # guard in forward_video_dynamic uses this to surface a clear
-            # error on checkpoints that were not trained with temporal
-            # compression, instead of silently running a random-init
-            # video_embedder.
-            self._video_embedder_loaded = False
 
         if abs_pos:
             scale = embed_dim**-0.5
@@ -301,14 +294,6 @@ class ViTPatchGenerator(nn.Module):
             tubelet_imgs_sizes: One ``(H, W)`` per tubelet.
             num_tubelets_per_video: Tubelet count per video.
         """
-        if not self._video_embedder_loaded:
-            raise ValueError(
-                "Temporal compression (video_temporal_patch_size > 1) "
-                "requires video_embedder weights, but they were never "
-                "loaded. Ensure the checkpoint was trained with "
-                "temporal compression."
-            )
-
         x_grouped, tubelet_imgs_sizes, num_tubelets_per_video = (
             self._apply_temporal_grouping(x, imgs_sizes, num_frames)
         )
@@ -926,13 +911,6 @@ class RadioModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, weight)
                 loaded_params.add(vllm_key)
-                # Flip the patch generator's load flag once any
-                # video_embedder weight has been loaded. The dynamic-
-                # resolution forward path checks this to refuse running
-                # on temporally-compressed video without trained
-                # weights.
-                if vllm_key.startswith("model.patch_generator.video_embedder."):
-                    self.model.patch_generator._video_embedder_loaded = True
 
         return loaded_params
 

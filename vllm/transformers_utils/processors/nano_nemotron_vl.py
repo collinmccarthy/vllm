@@ -916,11 +916,8 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
         ]
         video_num_patches = torch.tensor([len(item) for item in pixel_values_lst_video])
 
-        # Keep per-video tensors as a list: the matching field config in the
-        # model uses MultiModalFieldConfig.batched("video"), which iterates
-        # this sequence to build one item per video. Concatenating here would
-        # both (a) misbuild one item per *frame*, and (b) fail for multiple
-        # videos within one request that have differing H/W.
+        # Keep one tensor per video; the model-side batched("video") parser
+        # now treats each list element as a video and flattens frames later.
         video_inputs = {
             "pixel_values_flat_video": pixel_values_lst_video,
             "video_num_patches": video_num_patches,
@@ -1062,10 +1059,7 @@ class NanoNemotronVLProcessor(BaseNanoNemotronVLProcessor):
 
         # The video field is declared MultiModalFieldConfig.batched("video"),
         # which requires a per-video list[Tensor] so it can build one item
-        # per video. Under the default return_tensors="pt" that vLLM sets in
-        # MultiModalProcessingContext, BatchFeature would otherwise try to
-        # stack this list — silently collapsing same-shape videos and failing
-        # on mixed H/W.
+        # per video.
         pixel_values_flat_video = combined_inputs.pop("pixel_values_flat_video", None)
 
         if self.dynamic_tiler is None:

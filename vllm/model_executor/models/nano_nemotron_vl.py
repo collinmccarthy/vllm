@@ -175,8 +175,7 @@ class NanoNemotronVLVideoPixelInputs(TensorSchema):
     """
 
     type: Literal["pixel_values_videos"]
-    # list[Tensor] form is the mixed-resolution batch path; bare Tensor is
-    # the uniform-resolution path after reshape from the batched reducer.
+    # list[Tensor] form is the mixed-resolution batch path
     pixel_values_flat: Annotated[
         torch.Tensor | list[torch.Tensor], TensorShape("bvf", 3, "h", "w")
     ]
@@ -205,7 +204,7 @@ NanoNemotronVLVideoInputs: TypeAlias = (
 @dataclass(frozen=True)
 class _VideoSegment:
     """A contiguous run of frames from one video placed inside a microbatch.
-
+    Used for microbatching video frames.
     ``frame_start`` is video-relative (i.e. an offset into the video's own
     frame range, not into the concatenated ``pixel_values`` tensor).
     """
@@ -220,24 +219,11 @@ def _pack_video_segments_into_microbatches(
     micro_batch_size: int,
     T: int,
 ) -> list[list[_VideoSegment]]:
-    """Pack video frame segments into encoder microbatches.
+    """Pack videos into tubelet-aligned encoder microbatches.
 
-    Each returned inner list corresponds to one ``vision_model`` forward
-    call. The billed frame count of each microbatch is capped by
-    ``micro_batch_size``. Non-final segments are tubelet-aligned; final
-    segments may be padded by the vision model in the same way as solo
-    processing.
-
-    Invariants:
-    * each segment bills as ``ceil(num_frames / T) * T``
-    * each microbatch stays within ``micro_batch_size``
-    * non-final segments have ``num_frames % T == 0``
-    * final segments may be odd
-    * videos that fit whole are not split
-    * output order is video-major
-
-    ``num_frames_per_video`` must contain strictly positive frame counts;
-    an empty list is allowed and returns no microbatches.
+    Each inner list is one ``vision_model`` call capped by
+    ``micro_batch_size`` padded frames. Videos that fit are kept whole;
+    oversized videos are split in video-major order.
     """
     if T <= 0:
         raise ValueError("T must be positive")
@@ -250,29 +236,29 @@ def _pack_video_segments_into_microbatches(
     if any(nf <= 0 for nf in num_frames_per_video):
         raise ValueError("num_frames_per_video must contain positive frame counts")
 
-    def _bill(nf: int) -> int:
+    def _padded_frame_count(nf: int) -> int:
         return math.ceil(nf / T) * T
 
     microbatches: list[list[_VideoSegment]] = []
     cur_microbatch: list[_VideoSegment] = []
-    cur_billed = 0
+    cur_padded_frames = 0
 
     def _flush() -> None:
-        nonlocal cur_microbatch, cur_billed
+        nonlocal cur_microbatch, cur_padded_frames
         if cur_microbatch:
             microbatches.append(cur_microbatch)
             cur_microbatch = []
-            cur_billed = 0
+            cur_padded_frames = 0
 
     for video_idx, nf in enumerate(num_frames_per_video):
-        full_billed = _bill(nf)
+        full_padded_frames = _padded_frame_count(nf)
 
-        if full_billed <= micro_batch_size:
+        if full_padded_frames <= micro_batch_size:
             # Fits whole in a single microbatch: never split.
-            if cur_billed + full_billed > micro_batch_size:
+            if cur_padded_frames + full_padded_frames > micro_batch_size:
                 _flush()
             cur_microbatch.append(_VideoSegment(video_idx, 0, nf))
-            cur_billed += full_billed
+            cur_padded_frames += full_padded_frames
             continue
 
         # Too large for any single microbatch: chunk greedily, filling
@@ -281,20 +267,20 @@ def _pack_video_segments_into_microbatches(
         frame_start = 0
         remaining = nf
         while remaining > 0:
-            cap = micro_batch_size - cur_billed
+            remaining_capacity = micro_batch_size - cur_padded_frames
 
-            if _bill(remaining) <= cap:
+            if _padded_frame_count(remaining) <= remaining_capacity:
                 cur_microbatch.append(_VideoSegment(video_idx, frame_start, remaining))
-                cur_billed += _bill(remaining)
+                cur_padded_frames += _padded_frame_count(remaining)
                 frame_start += remaining
                 remaining = 0
             else:
-                chunk = (cap // T) * T
+                chunk = (remaining_capacity // T) * T
                 if chunk == 0:
                     _flush()
                     continue
                 cur_microbatch.append(_VideoSegment(video_idx, frame_start, chunk))
-                cur_billed += chunk
+                cur_padded_frames += chunk
                 frame_start += chunk
                 remaining -= chunk
 
@@ -499,11 +485,8 @@ class NanoNemotronVLMultiModalProcessor(
 
     def _get_video_fields_config(self, hf_inputs: BatchFeature):
         return dict(
-            # Per-video tensors: batched so that MultiModalBatchedField's
-            # reducer stacks same-shape videos into a 5D tensor and
-            # preserves list[Tensor] for mixed-resolution batches across
-            # requests (flat_from_sizes would pad the latter into a single
-            # tensor, hiding the varying-resolution path from the model).
+            # Keep one item per video. Same-shape videos may stack, while
+            # mixed-resolution videos stay as a list for model-side handling.
             pixel_values_flat_video=MultiModalFieldConfig.batched("video"),
             video_num_patches=MultiModalFieldConfig.batched("video"),
             frames_indices=MultiModalFieldConfig.batched("video"),
@@ -966,45 +949,15 @@ class NanoNemotronVLDummyInputsBuilder(
                 target_num_frames = num_frames
             num_videos = mm_counts.get("video", 0)
             video_overrides = mm_options.get("video")
-            # Under aspect-preserving sizing with more than one video,
-            # feed the processor non-square input shapes that alternate
-            # 3:2 landscape and 2:3 portrait. The aspect-preserving
-            # resize then produces distinct (target_w, target_h) outputs
-            # under the same patch budget, so memory profiling actually
-            # exercises the list-preserving reducer path of
-            # MultiModalBatchedField. Single-video and non-aspect-
-            # preserving profiling keep the cheap uniform path.
-            heterogeneous_aspect = (
-                num_videos > 1
-                and processor.video_target_num_patches is not None
-                and processor.video_maintain_aspect_ratio
-            )
-            if heterogeneous_aspect:
-                landscape_wh = (image_size * 3 // 2, image_size)
-                portrait_wh = (image_size, image_size * 3 // 2)
-                videos: list = []
-                for i in range(num_videos):
-                    w, h = landscape_wh if i % 2 == 0 else portrait_wh
-                    videos.extend(
-                        self._get_dummy_videos(
-                            width=w,
-                            height=h,
-                            num_frames=target_num_frames,
-                            num_videos=1,
-                            overrides=video_overrides,
-                        )
-                    )
-                dummy_video = {"video": videos}
-            else:
-                dummy_video = {
-                    "video": self._get_dummy_videos(
-                        width=video_width,
-                        height=video_height,
-                        num_frames=target_num_frames,
-                        num_videos=num_videos,
-                        overrides=video_overrides,
-                    )
-                }
+            dummy_video = {
+                "video": self._get_dummy_videos(
+                    width=video_width,
+                    height=video_height,
+                    num_frames=target_num_frames,
+                    num_videos=num_videos,
+                    overrides=video_overrides,
+                )
+            }
         else:
             dummy_video = {}
 
@@ -1058,29 +1011,6 @@ class NemotronH_Nano_VL_V2(
         if modality.startswith("audio"):
             return AUDIO_CONTEXT
         return None
-
-    def get_dummy_mm_counts_for_profiling(
-        self,
-        modality: str,
-        max_items_per_batch: int,
-    ) -> int:
-        """Ask for distinct dummy video items when aspect-preserving sizing
-        can produce mixed H/W across videos. This is what exercises the
-        varying-resolution path of `MultiModalBatchedField._reduce_data`
-        during memory profiling; without it, the profiler only ever sees
-        the uniform-shape stacked tensor path. Non-video modalities and
-        non-aspect-preserving video configs keep the default cheap path.
-        """
-        if modality != "video":
-            return 1
-        vision_config = getattr(self.config, "vision_config", self.config)
-        target_num_patches = getattr(vision_config, "video_target_num_patches", None)
-        maintain_aspect_ratio = getattr(
-            vision_config, "video_maintain_aspect_ratio", False
-        )
-        if target_num_patches is not None and maintain_aspect_ratio:
-            return max_items_per_batch
-        return 1
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -1428,12 +1358,8 @@ class NemotronH_Nano_VL_V2(
     ) -> tuple[torch.Tensor, ...]:
         """Extract per-video embeddings with temporal compression.
 
-        Two paths:
-        * **Same-resolution** (all videos share H, W): raw-pixel fast
-          path with encoder microbatches.
-        * **Varying-resolution** (different H, W across videos):
-          pre-patch to dynamic format and use the dynamic-resolution
-          ViT path with per-tubelet positional encoding.
+        Same-resolution videos use the raw-pixel microbatch path. Mixed
+        resolutions are pre-patched for the dynamic ViT path.
         """
         pixel_values = video_input["pixel_values_flat"]
         num_frames_per_video = video_input["num_patches"].tolist()
@@ -1479,7 +1405,7 @@ class NemotronH_Nano_VL_V2(
 
         Videos are split into tubelet-aligned segments and greedily packed
         into microbatches by ``_pack_video_segments_into_microbatches`` so
-        no encoder step exceeds the billed frame budget, while small
+        no encoder step exceeds the padded frame budget, while small
         videos still share a single ``vision_model`` forward call.
         """
         micro_batch_size = self._get_video_encoder_micro_batch_size(T)
@@ -1543,14 +1469,10 @@ class NemotronH_Nano_VL_V2(
         T: int,
         patch_size: int,
     ) -> tuple[torch.Tensor, ...]:
-        """Varying-resolution path: pre-patch frames to dynamic
-        format and process with per-tubelet positional encoding.
+        """Process mixed-resolution videos through the dynamic ViT path.
 
-        Whole videos are greedily grouped into encoder microbatches by
-        total patch count, targeting the same peak-memory envelope as
-        the same-resolution frame budget. A single video whose patch
-        count exceeds the budget is not split: it forms a microbatch of
-        its own and is sent through the encoder in one forward call.
+        Whole videos are grouped by patch count. A single video over budget
+        still runs alone because this path cannot split pre-patched videos.
         """
         max_patches_per_microbatch = self._get_video_encoder_max_patches_per_microbatch(
             patch_size, T

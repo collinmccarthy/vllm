@@ -5223,58 +5223,26 @@ class GPUModelRunner(
         """Dummy data for profiling and precompiling multimodal models."""
         assert self.mm_budget is not None
 
-        # Models can opt into heterogeneous profiling dummies (e.g.
-        # mixed aspect-ratio videos that exercise the varying-resolution
-        # reducer path of MultiModalBatchedField). The default is the
-        # cheap "ask for 1 and repeat N times" path.
-        counts_hook = getattr(self.model, "get_dummy_mm_counts_for_profiling", None)
-        distinct_count = (
-            counts_hook(modality, max_items_per_batch) if counts_hook else 1
-        )
-        distinct_count = max(1, min(int(distinct_count), max_items_per_batch))
-
+        # Don't use `max_items_per_batch` here to avoid redundant computation
         dummy_mm_inputs = self.mm_registry.get_dummy_mm_inputs(
             self.model_config,
-            mm_counts={modality: distinct_count},
+            mm_counts={modality: 1},
             cache=self.mm_budget.cache,
         )
-        dummy_items = dummy_mm_inputs["mm_kwargs"][modality]
+        dummy_mm_item = dummy_mm_inputs["mm_kwargs"][modality][0]
 
-        # Fail-fast at the source if the registry / hook contract is
-        # violated, instead of with an IndexError deep inside cycling.
-        assert len(dummy_items) >= distinct_count, (
-            f"Expected at least {distinct_count} dummy items for "
-            f"modality={modality!r}, got {len(dummy_items)}"
-        )
         # We use the cache so that the item is saved to the cache,
         # but not read from the cache
-        assert all(item is not None for item in dummy_items), (
-            "Items should not already be cached"
-        )
+        assert dummy_mm_item is not None, "Item should not already be cached"
 
-        expanded = [dummy_items[i % distinct_count] for i in range(max_items_per_batch)]
-
-        # All expanded items share the same modality and no
-        # MultiModalSharedField distinctions (profiling dummies), so
-        # group_and_batch_mm_kwargs should yield exactly one group of
-        # size max_items_per_batch. Make that an explicit contract so a
-        # future regression fails here instead of silently dropping
-        # items after the first group.
-        groups = list(
-            group_and_batch_mm_kwargs(
-                [(modality, item) for item in expanded],
+        return next(
+            mm_kwargs_batch
+            for _, _, mm_kwargs_batch in group_and_batch_mm_kwargs(
+                [(modality, dummy_mm_item)] * max_items_per_batch,
                 device=self.device,
                 pin_memory=self.pin_memory,
             )
         )
-        assert len(groups) == 1, (
-            f"Expected profiling dummies to batch into 1 group, got {len(groups)}"
-        )
-        _, num_items, mm_kwargs_batch = groups[0]
-        assert num_items == max_items_per_batch, (
-            f"Expected {max_items_per_batch} items in profiling batch, got {num_items}"
-        )
-        return mm_kwargs_batch
 
     @torch.inference_mode()
     def _dummy_run(
