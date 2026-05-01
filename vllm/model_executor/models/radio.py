@@ -797,6 +797,34 @@ class RadioModel(nn.Module):
         if "model.patch_generator.video_embedder.weight" in loaded_params:
             self.model.patch_generator._video_embedder_loaded = True
 
+        # Explicit LayerScale (ls1/ls2) init for RADIO ViT.
+        #
+        # The Megatron->HF bridge in
+        # `Megatron-Bridge/src/megatron/bridge/models/nemotron_vl/nemotron_vl_bridge.py`
+        # has no `llava_model.vision_model.decoder.layers.*.ls{1,2}` mapping,
+        # so the exported HF checkpoint carries no `ls1`/`ls2` keys -- consistent
+        # with Megatron's RADIOViTModel using a plain TransformerLayer with no
+        # LayerScale (effectively `ls=1` throughout).
+        #
+        # The HF/vLLM RADIO encoder layer (InternVisionEncoderLayer) however
+        # *does* multiply the attention and MLP residual contributions by
+        # `ls1` and `ls2`. Without explicit init they are left at vLLM's lazy
+        # uninitialized memory (~0 garbage in practice), which collapses every
+        # encoder layer to `x = x + ~0 * attn + ~0 * mlp ~= x` and turns the
+        # entire 32-layer ViT into a near-identity pass-through. That alone
+        # accounts for ~0.7 of the Token Mult Prob Error between vLLM and
+        # Megatron observed during GRPO on Nemotron Nano v3 VL.
+        #
+        # Fix: force `ls1`/`ls2` to ones so the encoder forward matches the
+        # Megatron contract. Add them to `loaded_params` so vLLM's missing-
+        # parameter accounting reflects the explicit init.
+        with torch.no_grad():
+            for li, layer in enumerate(self.model.encoder.layers):
+                layer.ls1.fill_(1.0)
+                layer.ls2.fill_(1.0)
+                loaded_params.add(f"model.encoder.layers.{li}.ls1")
+                loaded_params.add(f"model.encoder.layers.{li}.ls2")
+
         return loaded_params
 
     def _extract_final(
