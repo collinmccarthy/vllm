@@ -961,17 +961,31 @@ class NemotronH_Nano_VL_V2(
             vision_projection_hidden_size = config.projector_hidden_size
             llm_hidden_size = config.text_config.hidden_size
 
+            # `mlp1[0]` mirrors the fused norm inside the mcore projector's
+            # `TELayerNormColumnParallelLinear`. Type is dictated by training
+            # (`--vision-projection-fused-norm-type`); eps tracks Megatron's
+            # `--norm-epsilon`. The mcore→HF converter writes both into
+            # config.json as `projector_norm_type` / `projector_norm_eps`.
+            # Defaults (`rmsnorm`, 1e-5) preserve backwards compatibility with
+            # checkpoints that predate these fields. See `examples/multimodal/
+            # tools/create_yaml_inference_config.py::HF_OVERRIDES` for the
+            # conversion.
+            projector_input_size = vit_hidden_size * int(round(1 / self.downsample_ratio)) ** 2
+            projector_norm_type = getattr(config, "projector_norm_type", "rmsnorm")
+            projector_norm_eps = getattr(config, "projector_norm_eps", 1e-5)
+            if projector_norm_type == "layernorm":
+                proj_norm = nn.LayerNorm(projector_input_size, eps=projector_norm_eps)
+            elif projector_norm_type == "rmsnorm":
+                proj_norm = RMSNorm(hidden_size=projector_input_size, eps=projector_norm_eps)
+            else:
+                raise ValueError(
+                    f"unknown projector_norm_type: {projector_norm_type!r}; "
+                    f"expected 'layernorm' or 'rmsnorm'"
+                )
+
             mlp1 = nn.Sequential(
-                RMSNorm(
-                    hidden_size=vit_hidden_size
-                    * int(round(1 / self.downsample_ratio)) ** 2,
-                    eps=1e-5,
-                ),
-                nn.Linear(
-                    vit_hidden_size * int(round(1 / self.downsample_ratio)) ** 2,
-                    vision_projection_hidden_size,
-                    bias=False,
-                ),
+                proj_norm,
+                nn.Linear(projector_input_size, vision_projection_hidden_size, bias=False),
                 ReLUSquaredActivation(),
                 nn.Linear(vision_projection_hidden_size, llm_hidden_size, bias=False),
             )
