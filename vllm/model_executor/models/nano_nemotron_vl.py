@@ -35,10 +35,6 @@ from vllm.model_executor.models.interfaces import (
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.nemotron_h import NemotronHForCausalLM
 from vllm.model_executor.models.parakeet import ParakeetExtractor, ProjectedParakeet
-from vllm.model_executor.models.pixtral import (
-    PatchMerger as _PixtralNativePatchMerger,
-    PixtralHFVisionModel,
-)
 from vllm.model_executor.models.radio import RadioModel, calc_seq_lens
 from vllm.model_executor.models.utils import (
     WeightsMapper,
@@ -897,194 +893,6 @@ class NanoNemotronVLDummyInputsBuilder(
         return {**dummy_image, **dummy_video, **dummy_audio}
 
 
-class PixtralEncoderAdapter(nn.Module):
-    """Adapt vLLM's `PixtralHFVisionModel` + native `PatchMerger` to the RADIO-
-    style call interface used by `NemotronH_Nano_VL_V2.extract_feature_dynamic`:
-
-        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
-
-    Pixtral's HF encoder forward takes `list[Tensor]` (one per image), so we
-    unpack the dynamic-res tiler's packed `(1, total_patches, C*P*P)` tensor
-    into per-image `(C, H_px, W_px)` tensors here. After the encoder, we run
-    the mcore-trained merger (RMSNorm + Linear(4H→H)) per image and re-pack
-    the result into `(1, total_post_merger_tokens, H)` so the call site can
-    feed it straight into `mlp1` (skipping `pixel_shuffle_dynamic_res`).
-
-    The adapter owns its own RMSNorm pre-merger because vLLM's `PatchMerger`
-    is just the Linear — the trained mcore merger has RMSNorm sitting in
-    front of it.
-    """
-
-    def __init__(
-        self,
-        pixtral_config: "PixtralVisionConfig",  # noqa: F821
-        *,
-        patch_size: int,
-        spatial_merge_size: int = 2,
-        merger_norm_eps: float = 1e-5,
-        prefix: str = "",
-    ):
-        super().__init__()
-        self.patch_size = patch_size
-        self.spatial_merge_size = spatial_merge_size
-
-        self.encoder = PixtralHFVisionModel(
-            pixtral_config,
-            prefix=f"{prefix}.encoder" if prefix else "encoder",
-        )
-        # The trained mcore merger is RMSNorm(H) + Linear(4H → H, no bias).
-        # vLLM's `PatchMerger` exposes only the Linear; we host the RMSNorm.
-        self.merger_pre_norm = RMSNorm(
-            hidden_size=pixtral_config.hidden_size,
-            eps=merger_norm_eps,
-        )
-        self.merger = _PixtralNativePatchMerger(
-            vision_encoder_dim=pixtral_config.hidden_size,
-            spatial_merge_size=spatial_merge_size,
-            use_mlp_bias=False,
-        )
-
-    @property
-    def hidden_size(self) -> int:
-        # Post-merger hidden equals pre-merger hidden (Linear(4H→H)).
-        return self.encoder.config.hidden_size
-
-    def forward(
-        self,
-        pixel_values: torch.Tensor,
-        *,
-        imgs_sizes: list[tuple[int, int]] | None = None,
-        num_frames: int | None = None,
-    ) -> tuple[None, torch.Tensor]:
-        """Mirror RadioModel's `(summary, all_feat)` return so the caller is
-        encoder-agnostic. `summary` is unused for our downstream `mlp1`/LM
-        path, so we return None for it.
-
-        Two input shapes are accepted:
-        1. 3-D `(1, total_patches, C*P*P)` from the dynamic-res tiler. Pair
-           with `imgs_sizes=[(H_px_i, W_px_i), ...]`. Output:
-           `(1, sum_i(n_post_merger_i), H)`, post-merger token grid packed.
-        2. 4-D `(N, C, H, W)` from the static-tiling / video framewise path.
-           All images share `(H, W)`. Output: `(N, n_post_merger, H)`,
-           batched.
-
-        `num_frames` must be None — Pixtral conv3d / video temporal
-        compression isn't in mcore yet (Step 10 of vision-encoder-study plan).
-        """
-        if num_frames is not None:
-            raise NotImplementedError(
-                "Pixtral conv3d/temporal compression is not implemented in "
-                "mcore (see Step 10 of vision-encoder-study plan), so vLLM "
-                "doesn't accept `num_frames` for Pixtral. Train without "
-                "`--video-temporal-patch-size > 1` for now."
-            )
-
-        P = self.patch_size
-
-        if pixel_values.ndim == 3:
-            if imgs_sizes is None:
-                raise ValueError(
-                    "PixtralEncoderAdapter: 3-D dynamic-res input requires "
-                    "`imgs_sizes`."
-                )
-            # Unpack the dynamic-res tiler's flat patch stream back into
-            # per-image `(C, H_px, W_px)` tensors. Inverse of
-            # `DynamicResolutionImageTiler.stack` (see
-            # processors/nano_nemotron_vl.py).
-            flat = pixel_values.squeeze(0)  # (total_patches, C*P*P)
-            per_image: list[torch.Tensor] = []
-            cursor = 0
-            for h_px, w_px in imgs_sizes:
-                ph, pw = h_px // P, w_px // P
-                n = ph * pw
-                patches = flat[cursor : cursor + n]
-                cursor += n
-                # (n=ph*pw, C*P*P) → (ph, pw, C, P, P) → (C, ph*P, pw*P)
-                img = (
-                    patches.reshape(ph, pw, 3, P, P)
-                    .permute(2, 0, 3, 1, 4)
-                    .reshape(3, h_px, w_px)
-                    .contiguous()
-                )
-                per_image.append(img)
-            token_sizes = [(h_px // P, w_px // P) for h_px, w_px in imgs_sizes]
-
-            encoder_features = self.encoder(per_image)
-            merged: list[torch.Tensor] = []
-            for feat, token_size in zip(encoder_features, token_sizes):
-                feat = self.merger_pre_norm(feat)
-                feat = self.merger(feat, [token_size])  # (n/4, H)
-                merged.append(feat)
-            all_feat = torch.cat(merged, dim=0).unsqueeze(0)  # (1, sum_n/4, H)
-            return None, all_feat
-
-        elif pixel_values.ndim == 4:
-            if imgs_sizes is not None:
-                raise ValueError(
-                    "PixtralEncoderAdapter: don't pass `imgs_sizes` with 4-D "
-                    "input (it's static-tiling / video framewise, shapes are "
-                    "uniform)."
-                )
-            # Static (N, C, H, W) batched path used by `extract_feature` for
-            # video-as-frames and (if any) static-tiling image inputs. All
-            # frames share H, W.
-            N, _C, H, W = pixel_values.shape
-            token_size = (H // P, W // P)
-            per_image = [pixel_values[i] for i in range(N)]
-
-            encoder_features = self.encoder(per_image)
-            merged_stack: list[torch.Tensor] = []
-            for feat in encoder_features:
-                feat = self.merger_pre_norm(feat)
-                feat = self.merger(feat, [token_size])  # (n/4, H)
-                merged_stack.append(feat)
-            # Stack to (N, n_post_merger, H) so the caller's reshape path can
-            # treat it like RadioModel's batched output.
-            return None, torch.stack(merged_stack, dim=0)
-
-        else:
-            raise ValueError(
-                f"PixtralEncoderAdapter: expected 3-D dynamic-res or 4-D "
-                f"static input; got shape {tuple(pixel_values.shape)}."
-            )
-
-    def load_weights(self, weights):
-        """Route mcore-exported HF keys (after the outer `vision_model.` strip
-        in `NemotronH_Nano_VL_V2.load_weights`) into the adapter submodules.
-
-        Incoming key examples (post outer-strip):
-          vision_model.patch_conv.weight
-              → encoder.patch_conv.weight
-          vision_model.transformer.layers.{i}.attention.qkv_proj.weight
-              → encoder.transformer.layers.{i}.attention.qkv_proj.weight
-          vision_model.merger.pre_norm.weight
-              → merger_pre_norm.weight (host-owned, not vLLM PatchMerger)
-          vision_model.merger.linear_fc1.weight
-              → merger.merging_layer.weight (vLLM PatchMerger's Linear)
-        """
-        params_dict = dict(self.named_parameters())
-        encoder_weights: list[tuple[str, torch.Tensor]] = []
-        for name, w in weights:
-            if not name.startswith("vision_model."):
-                raise ValueError(
-                    f"PixtralEncoderAdapter expected a `vision_model.` "
-                    f"prefix on incoming weight key; got {name!r}"
-                )
-            rest = name[len("vision_model.") :]
-            if rest == "merger.pre_norm.weight":
-                with torch.no_grad():
-                    default_weight_loader(params_dict["merger_pre_norm.weight"], w)
-            elif rest == "merger.linear_fc1.weight":
-                with torch.no_grad():
-                    default_weight_loader(
-                        params_dict["merger.merging_layer.weight"], w
-                    )
-            else:
-                encoder_weights.append((rest, w))
-        if encoder_weights:
-            self.encoder.load_weights(encoder_weights)
-
-
 @MULTIMODAL_REGISTRY.register_processor(
     NanoNemotronVLMultiModalProcessor,
     info=NanoNemotronVLProcessingInfo,
@@ -1160,7 +968,14 @@ class NemotronH_Nano_VL_V2(
                 # Pixtral's native 2×2 merger runs inside the encoder adapter
                 # (RMSNorm + Linear(4H→H), trained alongside the projector).
                 # Downstream pixel_shuffle must be SKIPPED to avoid double-reduction.
-                self.vision_model = self._build_pixtral_encoder(
+                # Lazy import keeps Pixtral plumbing (subclasses of vLLM's
+                # Mistral-format encoder, dynamic 2D RoPE, FA-varlen mask
+                # metadata, merger adapter) out of this file — see
+                # `nano_nemotron_vl_mistral.py`.
+                from vllm.model_executor.models.nano_nemotron_vl_mistral import (
+                    build_pixtral_encoder,
+                )
+                self.vision_model = build_pixtral_encoder(
                     config, prefix=maybe_prefix(prefix, "vision_model")
                 ).to(llm_dtype)
                 self._encoder_did_spatial_merge = True
@@ -1844,43 +1659,6 @@ class NemotronH_Nano_VL_V2(
         )
 
         return RadioModel(config=radio_config)
-
-    def _build_pixtral_encoder(self, hf_config, *, prefix: str = ""):
-        """Build the Pixtral-Large encoder + native 2×2 merger adapter.
-
-        Architecture constants come from `megatron-lm/megatron/core/models/vision/
-        encoder_registry.py`'s `pixtral-vit-large` entry (the single Pixtral
-        variant in scope for the current vision-encoder study). If we ever need
-        to support another Pixtral variant, parametrize from
-        `hf_config.vision_config` instead of hardcoding here.
-
-        `image_size` controls HF `PixtralRotaryEmbedding`'s precomputed table:
-        max patches per side = `image_size // patch_size`. Dynamic resolution
-        can exceed the trained base of 448 × 448; we set `image_size=2520`
-        (180 patches/side) as a buffer over what a max-`max_num_patches=13312`
-        run can produce in a single dimension (~163 patches for an extreme
-        aspect ratio).
-        """
-        from transformers import PixtralVisionConfig
-        pixtral_config = PixtralVisionConfig(
-            hidden_size=1664,
-            intermediate_size=8192,
-            num_hidden_layers=48,
-            num_attention_heads=16,
-            num_channels=3,
-            image_size=2520,
-            patch_size=14,
-            hidden_act="silu",
-            rope_theta=10000.0,
-            attention_dropout=0.0,
-        )
-        return PixtralEncoderAdapter(
-            pixtral_config,
-            patch_size=14,
-            spatial_merge_size=2,
-            merger_norm_eps=getattr(hf_config, "projector_norm_eps", 1e-5),
-            prefix=prefix,
-        )
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(
